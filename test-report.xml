@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?><testsuite errors="0" failures="2" name="pytest" skips="0" tests="2" time="0.606"><testcase classname="src.toil_topmed.test.test_topmed_cgl" file="src/toil_topmed/test/test_topmed_cgl.py" line="12" name="test_parse_samples_valid_cases" time="0.00337100028992"><failure message="TypeError: unhashable type: &apos;list&apos;">tmpdir = local(&apos;/tmp/pytest-of-trevorp/pytest-4/test_parse_samples_valid_cases0&apos;)
+
+    def test_parse_samples_valid_cases(tmpdir):
+    
+        # fq validation
+        out1 = _test_successful_parse_sample(tmpdir, &quot;uuid&quot;, &quot;fq&quot;, &quot;single&quot;,
+                [&quot;file:///file.fq&quot;, &quot;http://host/file.fastq&quot;, &quot;s3:///bucket/file.fq.gz&quot;, &quot;ftp://host/file.fastq.gz&quot;])
+        out2 = _test_successful_parse_sample(tmpdir, &quot;uuid&quot;, &quot;fq&quot;, &quot;paired&quot;,
+&gt;               [&quot;file:///file_1.fq&quot;, &quot;file:///file_2.fq&quot;, &quot;file:///fileR1.fq&quot;, &quot;file:///fileR2.fq&quot;])
+
+src/toil_topmed/test/test_topmed_cgl.py:19: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+src/toil_topmed/test/test_topmed_cgl.py:100: in _test_successful_parse_sample
+    output = parse_samples(manifest_location)
+src/toil_topmed/topmed_cgl_pipeline.py:113: in parse_samples
+    require(file_count_with_suffix(url, &quot;R1&quot;) == file_count_with_suffix(url, &quot;R2&quot;),
+src/toil_topmed/topmed_cgl_pipeline.py:112: in file_count_with_suffix
+    lambda x: os.path.splitext(os.path.basename(urlparse(url).path))[0].endswith(suffix), urls))
+src/toil_topmed/topmed_cgl_pipeline.py:112: in &lt;lambda&gt;
+    lambda x: os.path.splitext(os.path.basename(urlparse(url).path))[0].endswith(suffix), urls))
+/usr/lib/python2.7/urlparse.py:143: in urlparse
+    tuple = urlsplit(url, scheme, allow_fragments)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+url = [&apos;file:///file_1.fq&apos;, &apos;file:///file_2.fq&apos;, &apos;file:///fileR1.fq&apos;, &apos;file:///fileR2.fq&apos;], scheme = &apos;&apos;, allow_fragments = True
+
+    def urlsplit(url, scheme=&apos;&apos;, allow_fragments=True):
+        &quot;&quot;&quot;Parse a URL into 5 components:
+        &lt;scheme&gt;://&lt;netloc&gt;/&lt;path&gt;?&lt;query&gt;#&lt;fragment&gt;
+        Return a 5-tuple: (scheme, netloc, path, query, fragment).
+        Note that we don&apos;t break the components up in smaller bits
+        (e.g. netloc is a single string) and we don&apos;t expand % escapes.&quot;&quot;&quot;
+        allow_fragments = bool(allow_fragments)
+        key = url, scheme, allow_fragments, type(url), type(scheme)
+&gt;       cached = _parse_cache.get(key, None)
+E       TypeError: unhashable type: &apos;list&apos;
+
+/usr/lib/python2.7/urlparse.py:176: TypeError</failure></testcase><testcase classname="src.toil_topmed.test.test_topmed_cgl" file="src/toil_topmed/test/test_topmed_cgl.py" line="51" name="test_parse_samples_error_cases" time="0.00308990478516"><failure message="TypeError: unhashable type: &apos;list&apos;">tmpdir = local(&apos;/tmp/pytest-of-trevorp/pytest-4/test_parse_samples_error_cases0&apos;)
+
+    def test_parse_samples_error_cases(tmpdir):
+    
+        # scheme issues
+        _test_failed_parse_sample(tmpdir, &quot;uuid&quot;, &quot;fq&quot;, &quot;single&quot;, [&quot;badscheme:///file.fq&quot;],
+                                  &quot;expected error for bad scheme&quot;)
+        _test_failed_parse_sample(tmpdir, &quot;uuid&quot;, &quot;bam&quot;, &quot;single&quot;, [&quot;badscheme:///file.bam&quot;],
+                                  &quot;expected error for bad scheme&quot;)
+        _test_failed_parse_sample(tmpdir, &quot;uuid&quot;, &quot;tar&quot;, &quot;single&quot;, [&quot;badscheme:///file.tar&quot;],
+                                  &quot;expected error for bad scheme&quot;)
+    
+        # extension issues
+        _test_failed_parse_sample(tmpdir, &quot;uuid&quot;, &quot;fq&quot;, &quot;single&quot;, [&quot;file:///file.badextension&quot;],
+                                  &quot;expected error for bad extension&quot;)
+        _test_failed_parse_sample(tmpdir, &quot;uuid&quot;, &quot;bam&quot;, &quot;single&quot;, [&quot;file:///file.badextension&quot;],
+                                  &quot;expected error for bad extension&quot;)
+        _test_failed_parse_sample(tmpdir, &quot;uuid&quot;, &quot;tar&quot;, &quot;single&quot;, [&quot;file:///file.badextension&quot;],
+                                  &quot;expected error for bad extension&quot;)
+    
+        # paired issues
+        _test_failed_parse_sample(tmpdir, &quot;uuid&quot;, &quot;fq&quot;, &quot;paired&quot;, [&quot;file:///file.fq&quot;, &quot;file:///anotherfile.fq&quot;],
+&gt;                                 &quot;expected error for inconsistent file pairs&quot;)
+
+src/toil_topmed/test/test_topmed_cgl.py:72: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+src/toil_topmed/test/test_topmed_cgl.py:120: in _test_failed_parse_sample
+    parse_samples(manifest_location)
+src/toil_topmed/topmed_cgl_pipeline.py:113: in parse_samples
+    require(file_count_with_suffix(url, &quot;R1&quot;) == file_count_with_suffix(url, &quot;R2&quot;),
+src/toil_topmed/topmed_cgl_pipeline.py:112: in file_count_with_suffix
+    lambda x: os.path.splitext(os.path.basename(urlparse(url).path))[0].endswith(suffix), urls))
+src/toil_topmed/topmed_cgl_pipeline.py:112: in &lt;lambda&gt;
+    lambda x: os.path.splitext(os.path.basename(urlparse(url).path))[0].endswith(suffix), urls))
+/usr/lib/python2.7/urlparse.py:143: in urlparse
+    tuple = urlsplit(url, scheme, allow_fragments)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+url = [&apos;file:///file.fq&apos;, &apos;file:///anotherfile.fq&apos;], scheme = &apos;&apos;, allow_fragments = True
+
+    def urlsplit(url, scheme=&apos;&apos;, allow_fragments=True):
+        &quot;&quot;&quot;Parse a URL into 5 components:
+        &lt;scheme&gt;://&lt;netloc&gt;/&lt;path&gt;?&lt;query&gt;#&lt;fragment&gt;
+        Return a 5-tuple: (scheme, netloc, path, query, fragment).
+        Note that we don&apos;t break the components up in smaller bits
+        (e.g. netloc is a single string) and we don&apos;t expand % escapes.&quot;&quot;&quot;
+        allow_fragments = bool(allow_fragments)
+        key = url, scheme, allow_fragments, type(url), type(scheme)
+&gt;       cached = _parse_cache.get(key, None)
+E       TypeError: unhashable type: &apos;list&apos;
+
+/usr/lib/python2.7/urlparse.py:176: TypeError</failure></testcase></testsuite>
