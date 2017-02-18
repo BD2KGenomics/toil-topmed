@@ -21,17 +21,27 @@ from toil_lib.files import tarball_files, copy_files
 from toil_lib.jobs import map_job
 from toil_lib.urls import download_url, s3am_upload
 
-
+# formats
 SCHEMES = ('http', 'file', 's3', 'ftp')
 FILE_TYPES = ('fq', 'tar', 'bam')
 PAIRED_TYPES = ('single', 'paired')
 FQ_FORMATS = ('.fq', '.fastq', '.fq.gz', '.fastq.gz')
 TAR_FORMATS = ('.tar', '.tar.gz')
 BAM_FORMATS = ('.bam')
+ZIP_FORMATS = ('.fq.gz', '.fastq.gz', '.tar', '.tar.gz')
+PAIRED_FRONT_SUFFIXES = ("_1", "R1")
+PAIRED_BACK_SUFFIXES = ("_2", "R2")
 
+# filenames
 DEFAULT_CONFIG_NAME = 'config-toil-topmed.yaml'
 DEFAULT_MANIFEST_NAME = 'manifest-toil-topmed.tsv'
 
+# docker images
+#todo unlatest this
+DOCKER_SAMTOOLS = "quay.io/ucsc_cgl/samtools:latest"
+
+# todo temporary for development
+trevdev = True
 
 # Pipeline specific functions
 def parse_samples(path_to_manifest):
@@ -107,13 +117,10 @@ def parse_samples(path_to_manifest):
 
             # validate paired samples
             if paired == 'paired' and type == 'fq':
-                def file_count_with_suffix(urls, suffix):
-                    return len(filter(
-                        lambda u: os.path.splitext(os.path.basename(urlparse(u).path))[0].endswith(suffix), urls))
-                r1 = file_count_with_suffix(url, "R1")
-                r2 = file_count_with_suffix(url, "R2")
-                u1 = file_count_with_suffix(url, "_1")
-                u2 = file_count_with_suffix(url, "_2")
+                r1 = len(_files_with_suffix(url, "R1"))
+                r2 = len(_files_with_suffix(url, "R2"))
+                u1 = len(_files_with_suffix(url, "_1"))
+                u2 = len(_files_with_suffix(url, "_2"))
                 require(r1 == r2, 'URL "{}" not valid for "paired" type: inconsistent files ending with "R1" and "R2"')
                 require(u1 == u2, 'URL "{}" not valid for "paired" type: inconsistent files ending with "_1" and "_2"')
                 require(r1 + r2 + u1 + u2 > 0,
@@ -124,8 +131,16 @@ def parse_samples(path_to_manifest):
     return samples
 
 
+def _files_with_suffix(urls, suffix):
+    """
+    Returns filtered list of files in 'urls' which end with the suffix (disregarding file type)
+    :param urls: list of fully-qualified file names (with or without scheme)
+    :param suffix: string (or string tuple) to filter files on
+    :return: list of strings
+    """
+    return filter(lambda u: os.path.splitext(os.path.basename(urlparse(u).path))[0].endswith(suffix), urls)
 
-def prepare_input():
+def prepare_input(job, sample, config):
     """
     input: list of files in .bam or .fq or tarballs
     for each input file:
@@ -138,15 +153,174 @@ def prepare_input():
         (this will be a big file, is this an issue?)
     output: one (paired potentially) big fastq file
     """
+
+    # prepare
+    config = argparse.Namespace(**vars(config))
+    config.cores = min(config.maxCores, multiprocessing.cpu_count())
+    uuid, file_type, paired, urls = sample
+    is_paired = paired == "paired"
+    config.uuid = uuid
+    work_dir = job.fileStore.getLocalTempDir()
+    fastq_location = os.path.join(work_dir, "fastq")
+    os.mkdir(fastq_location)
+    bam_location = os.path.join(work_dir, "bam")
+    os.mkdir(bam_location)
+
+    # first, get all files
+    for url in urls:
+        #need to untar them (for .tar, .tar.gz, .fq.gz, .fastq.gz)
+        if url.endswith(TAR_FORMATS):
+            #todo: verify this works with all the tar formats (including fq stuff)
+            tar_path = os.path.join(work_dir, os.path.basename(url))
+            download_url(job, url=url, work_dir=work_dir)
+            subprocess.check_call(['tar', '-xvf', tar_path, '-C', fastq_location])
+            os.remove(tar_path)
+        #need to extract to fq
+        elif file_type == 'bam':
+            # download bam
+            download_url(job, url=url, work_dir=bam_location)
+            # prep for extraction
+            filename = os.path.basename(url)
+            parameters = ["fastq"]
+            if is_paired:
+                parameters.extend(["-1", "/data/fastq/{}_1.fq".format(filename),
+                                  "-2" "/data/fastq/{}_2.fq".format(filename),
+                                  "-0" "/data/bam/{}_unpaired.bam".format(filename)])
+            else:
+                parameters.extend(["-1", "/data/fastq/{}.fq".format(filename)])
+            parameters.extend(["/data/bam/{}".format(filename)])
+            # extract
+            job.fileStore.logToMaster("Running {} with parameters: {}".format(DOCKER_SAMTOOLS, parameters))
+            dockerCall(job, tool=DOCKER_SAMTOOLS,
+                       workDir=work_dir, parameters=parameters)
+            # validate the unpaired reads
+            unpaired_size = os.stat(os.path.join(bam_location, "{}_unpaired.bam".format(filename))).st_size
+            if unpaired_size != 0:
+                #todo throw usererror?
+                job.fileStore.logToMaster("Got non-zero length ({}) for unmatched reads in file \"{}\""
+                                          .format(unpaired_size, filename))
+        # just need to download
+        elif url.endswith(FQ_FORMATS) and not url.endswith(TAR_FORMATS):
+            download_url(job, url=url, work_dir=fastq_location)
+        # should never happen
+        else:
+            raise UserError('PROGRAMMER ERROR: URL "{}" with type "{}" did not match expected cases for downloading!'
+                            .format(url, file_type))
+
+    # now we need to concatinate them together
+    all_fq_files = os.listdir(fastq_location)
+    if len(all_fq_files) == 0:
+        raise UserError("Found no fastq files after preparation for concatination.")
+    output = None
+
+    # for handling paired sample data
+    if is_paired:
+        #prep
+        front_files = _files_with_suffix(all_fq_files, PAIRED_FRONT_SUFFIXES)
+        back_files = _files_with_suffix(all_fq_files, PAIRED_BACK_SUFFIXES)
+        front_files.sort()
+        back_files.sort()
+
+        #sanity check same number of files
+        if len(front_files ) != len(back_files):
+            raise UserError('Found inconsistent number of files ({} / {}) for "paired" input: {}'
+                            .format(len(front_files), len(back_files), [os.path.basename(f) for f in all_fq_files]))
+        #sanity check not missing any files
+        for fq in all_fq_files:
+            if fq not in front_files or fq not in back_files:
+                raise UserError('Found fq file without suffix "_1"/"_2" or "R1"/"R2" for "paired" input: {}'.format(fq))
+        #sanity check all files have a pair and are of the same size
+        total_f_size = 0
+        total_b_size = 0
+        for f,b in zip(front_files, back_files):
+            f_size = os.stat(f).st_size
+            b_size = os.stat(b).st_size
+            if f[:f.rfind(PAIRED_FRONT_SUFFIXES)] != b[:b.rfind(PAIRED_BACK_SUFFIXES)]:
+                raise UserError('Found mismatched paired fq files: "{}" / "{}"'
+                                .format(os.path.basename(f), os.path.basename(b)))
+            if f_size != b_size:
+                raise UserError('Found paired fq files of different sizes: "{}" ({}) / "{}" ({})"'
+                                .format(f, f_size, b, b_size))
+            total_f_size += f_size
+            total_b_size += b_size
+
+        # we know that sorted order of front_files and back_files match in name and size
+        # concatinate all files
+        front_outfile = os.path.join(work_dir, uuid + "_1.fq")
+        back_outfile = os.path.join(work_dir, uuid + "_2.fq")
+        with open(front_outfile, 'w') as outfile:
+            for f in front_files:
+                with open(f) as infile:
+                    for line in infile:
+                        outfile.write(line)
+        with open(back_outfile, 'w') as outfile:
+            for b in back_files:
+                with open(b) as infile:
+                    for line in infile:
+                        outfile.write(line)
+
+        # another sanity check
+        if os.stat(front_outfile).st_size != total_f_size:
+            job.fileStore.logToMaster('File size {} from concatinated front files does not match expected value {}'
+                  .format(os.stat(front_outfile).st_size, total_f_size))
+        if os.stat(back_outfile).st_size != total_b_size:
+            job.fileStore.logToMaster('File size {} from concatinated back files does not match expected value {}'
+                  .format(os.stat(back_outfile).st_size, total_b_size))
+
+        # save to output directory
+        if trevdev:
+            job.fileStore.logToMaster('Moving {} to output dir: {}'.format(front_outfile, config.output_dir))
+            mkdir_p(config.output_dir)
+            copy_files(file_paths=[front_outfile], output_dir=config.output_dir)
+            job.fileStore.logToMaster('Moving {} to output dir: {}'.format(back_outfile, config.output_dir))
+            copy_files(file_paths=[back_outfile], output_dir=config.output_dir)
+        else:
+            front_outfile_id = job.fileStore.writeGlobalFile(front_outfile)
+            back_outfile_id = job.fileStore.writeGlobalFile(back_outfile)
+            output = [front_outfile_id, back_outfile_id]
+    # for handling non-paired sample data
+    else:
+        output_file = os.path.join(work_dir, uuid + ".fq")
+        total_size = 0
+        with open(output_file, 'w') as outfile:
+            for f in all_fq_files:
+                total_size += os.stat(f).st_size
+                with open(f) as infile:
+                    for line in infile:
+                        outfile.write(line)
+
+        # another sanity check
+        if os.stat(output_file).st_size != total_size:
+            job.fileStore.logToMaster('File size {} from concatinated front files does not match expected value {}'
+                                      .format(os.stat(output_file).st_size, total_size))
+
+        # save to output directory
+        if trevdev:
+            job.fileStore.logToMaster('Moving {} to output dir: {}'.format(output_file, config.output_dir))
+            mkdir_p(config.output_dir)
+            copy_files(file_paths=[outfile], output_dir=config.output_dir)
+        else:
+            output_file_id = job.fileStore.writeGlobalFile(output_file)
+            output = output_file
+
+    # sanity check
+    if outfile is None:
+        raise UserError("PROGRAMMER ERROR: missing output file after concatination!")
+
+    # add next job
+    job.addFollowOnJobFn(perform_alignment, config, output)
+
+
     pass
 
-def perform_alignment():
+def perform_alignment(job, config, fq_file):
     """
     input: one (paired potentially fastq file
     run the bwa-mem container situation
     output: bam file?
     """
-    pass
+    job.fileStore.logToMaster("Got to perform alignment successfully with {} input"
+                              .format("single" if isinstance(fq_file, str) else "paired"))
 
 def mark_duplicates():
     """
@@ -316,11 +490,12 @@ def main():
         config.maxCores = int(args.maxCores) if args.maxCores else sys.maxint
 
         # Config sanity checks
-        require(config.kallisto_index,
-                'URLs not provided for Kallisto index, so there is nothing to do!')
         require(config.output_dir, 'No output location specified: {}'.format(config.output_dir))
-        require(urlparse(config.kallisto_index).scheme in SCHEMES,
-                'Kallisto index in config must have the appropriate URL prefix: {}'.format(SCHEMES))
+        #todo more sanity checks
+        # require(config.kallisto_index,
+        #         'URLs not provided for Kallisto index, so there is nothing to do!')
+        # require(urlparse(config.kallisto_index).scheme in SCHEMES,
+        #         'Kallisto index in config must have the appropriate URL prefix: {}'.format(SCHEMES))
         if not config.output_dir.endswith('/'):
             config.output_dir += '/'
 
@@ -329,7 +504,7 @@ def main():
             require(next(which(program), None), program + ' must be installed on every node.'.format(program))
 
         # Start the workflow
-        Job.Runner.startToil(Job.wrapJobFn(map_job, "$START_FUNCTION", samples, config), args)
+        Job.Runner.startToil(Job.wrapJobFn(map_job, prepare_input, samples, config), args)
 
 
 if __name__ == '__main__':

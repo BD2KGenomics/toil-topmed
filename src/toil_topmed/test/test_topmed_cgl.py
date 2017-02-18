@@ -73,6 +73,10 @@ def test_parse_samples_error_cases(tmpdir):
     _test_failed_parse_sample(tmpdir, "uuid", "fq", "paired", ["file:///file.fq", "file:///anotherfile.fq"],
                               "expected error for inconsistent file pairs")
 
+    # tar issue
+    _test_failed_parse_sample(tmpdir, "uuid", "tar", "single", ["file:///file.tar", "file:///anotherfile.tar"],
+                              "expected error for multiple tars")
+
     # input issues
     _test_failed_parse_sample(tmpdir, "uuid", "badfiletype", "paired", ["file:///file.fq"],
                               "expected error for bad file type")
