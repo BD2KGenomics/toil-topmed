@@ -184,8 +184,8 @@ def prepare_input(job, sample, config):
             parameters = ["fastq"]
             if is_paired:
                 parameters.extend(["-1", "/data/fastq/{}_1.fq".format(filename),
-                                  "-2" "/data/fastq/{}_2.fq".format(filename),
-                                  "-0" "/data/bam/{}_unpaired.bam".format(filename)])
+                                   "-2", "/data/fastq/{}_2.fq".format(filename),
+                                   "-0", "/data/bam/{}_unpaired.bam".format(filename)])
             else:
                 parameters.extend(["-1", "/data/fastq/{}.fq".format(filename)])
             parameters.extend(["/data/bam/{}".format(filename)])
@@ -227,17 +227,20 @@ def prepare_input(job, sample, config):
                             .format(len(front_files), len(back_files), [os.path.basename(f) for f in all_fq_files]))
         #sanity check not missing any files
         for fq in all_fq_files:
-            if fq not in front_files or fq not in back_files:
+            if fq not in front_files and fq not in back_files:
                 raise UserError('Found fq file without suffix "_1"/"_2" or "R1"/"R2" for "paired" input: {}'.format(fq))
         #sanity check all files have a pair and are of the same size
         total_f_size = 0
         total_b_size = 0
         for f,b in zip(front_files, back_files):
-            f_size = os.stat(f).st_size
-            b_size = os.stat(b).st_size
-            if f[:f.rfind(PAIRED_FRONT_SUFFIXES)] != b[:b.rfind(PAIRED_BACK_SUFFIXES)]:
-                raise UserError('Found mismatched paired fq files: "{}" / "{}"'
-                                .format(os.path.basename(f), os.path.basename(b)))
+            f_size = os.stat(os.path.join(fastq_location, f)).st_size
+            b_size = os.stat(os.path.join(fastq_location, f)).st_size
+            for fs, bs in zip(PAIRED_FRONT_SUFFIXES, PAIRED_BACK_SUFFIXES):
+                fidx = f.rfind(fs)
+                bidx = b.rfind(bs)
+                if not (fidx == -1 and bidx == -1) and (f[:f.rfind(fs)] != b[:b.rfind(bs)]):
+                    raise UserError('Found mismatched paired fq files: "{}" / "{}"'
+                                    .format(os.path.basename(f), os.path.basename(b)))
             if f_size != b_size:
                 raise UserError('Found paired fq files of different sizes: "{}" ({}) / "{}" ({})"'
                                 .format(f, f_size, b, b_size))
@@ -250,12 +253,12 @@ def prepare_input(job, sample, config):
         back_outfile = os.path.join(work_dir, uuid + "_2.fq")
         with open(front_outfile, 'w') as outfile:
             for f in front_files:
-                with open(f) as infile:
+                with open(os.path.join(fastq_location, f)) as infile:
                     for line in infile:
                         outfile.write(line)
         with open(back_outfile, 'w') as outfile:
             for b in back_files:
-                with open(b) as infile:
+                with open(os.path.join(fastq_location, b)) as infile:
                     for line in infile:
                         outfile.write(line)
 
