@@ -170,7 +170,7 @@ def prepare_input(job, sample, config):
     for url in urls:
         #need to untar them (for .tar, .tar.gz, .fq.gz, .fastq.gz)
         if url.endswith(TAR_FORMATS):
-            #todo: verify this works with all the tar formats (including fq stuff)
+            #todo: verify this works with all the tar formats (including fq stuff) b
             tar_path = os.path.join(work_dir, os.path.basename(url))
             download_url(job, url=url, work_dir=work_dir)
             subprocess.check_call(['tar', '-xvf', tar_path, '-C', fastq_location])
@@ -351,12 +351,6 @@ def perform_alignment(job, config, fq_file_ids):
     # add next job
     job.addFollowOnJobFn(mark_duplicates, config, aligned_bam_id)
 
-    # save to output directory (for development) todo: remove this
-    if trevdev:
-        job.fileStore.logToMaster('Moving {} to output dir: {}'.format(aligned_bam_name, config.output_dir))
-        mkdir_p(config.output_dir)
-        copy_files(file_paths=[aligned_bam_location], output_dir=config.output_dir)
-
 
 def mark_duplicates(job, config, aligned_bam_id):
     """
@@ -385,12 +379,6 @@ def mark_duplicates(job, config, aligned_bam_id):
     # add next job
     job.addFollowOnJobFn(recalibrate_quality_scores, config, deduped_bam_id)
 
-    # save to output directory (for development) todo: remove this
-    if trevdev:
-        job.fileStore.logToMaster('Moving {} to output dir: {}'.format(deduped_bam_name, config.output_dir))
-        mkdir_p(config.output_dir)
-        copy_files(file_paths=[deduped_bam_location], output_dir=config.output_dir)
-
 
 def recalibrate_quality_scores(job, config, deduped_bam_id):
     """
@@ -417,12 +405,6 @@ def recalibrate_quality_scores(job, config, deduped_bam_id):
     # add next job
     job.addFollowOnJobFn(bin_quality_scores, config, recalibrated_bam_id)
 
-    # save to output directory (for development) todo: remove this
-    if trevdev:
-        job.fileStore.logToMaster('Moving {} to output dir: {}'.format(recalibrated_bam_name, config.output_dir))
-        mkdir_p(config.output_dir)
-        copy_files(file_paths=[recalibrated_bam_location], output_dir=config.output_dir)
-
 
 def bin_quality_scores(job, config, recalibrated_bam_id):
     """
@@ -447,42 +429,36 @@ def bin_quality_scores(job, config, recalibrated_bam_id):
     binnedqs_bam_id = job.fileStore.writeGlobalFile(binnedqs_bam_location)
 
     # add next job
-    job.addFollowOnJobFn(validate_bam, config, binnedqs_bam_id)
-
-    # save to output directory (for development) todo: remove this
-    if trevdev:
-        job.fileStore.logToMaster('Moving {} to output dir: {}'.format(binnedqs_bam_name, config.output_dir))
-        mkdir_p(config.output_dir)
-        copy_files(file_paths=[binnedqs_bam_location], output_dir=config.output_dir)
+    job.addFollowOnJobFn(validate_output, config, recalibrated_bam_id)
+    pass
 
 
-def validate_bam(job, config, bam_id):
+def validate_output(job, config, binnedqs_bam_id):
     """
 
     """
     #prep
-    bam_name = config.uuid + ".bam"
-    validation_ouput = config.uuid + "_validation.log"
-    job.fileStore.logToMaster('Validating BAM {}'.format(bam_name))
+    binnedqs_bam_name = config.uuid + "_binnedqs.bam"
+    validated_bam_name = config.uuid + ".bam"
+    job.fileStore.logToMaster('Validating BAM on {}'.format(recalibrated_bam_name))
 
     # read file
     work_dir = job.fileStore.getLocalTempDir()
-    job.fileStore.readGlobalFile(bam_id, os.path.join(work_dir, bam_name))
+    job.fileStore.readGlobalFile(recalibrated_bam_id, os.path.join(work_dir, recalibrated_bam_name))
 
-    #todo call out to picard validator
+    #todo call out to GATK
 
-    validation_log_location = os.path.join(work_dir, bam_name)
+    binnedqs_bam_location = os.path.join(work_dir, binnedqs_bam_name)
     # sanity check
-    if not os.path.isfile(validation_log_location):
-        raise UserError('Validation output file "{}" does not exist'.format(validation_ouput))
+    if not os.path.isfile(binnedqs_bam_location):
+        raise UserError('Binned-quality-scores BAM file "{}" does not exist'.format(binnedqs_bam_location))
 
-    validation_log_id = job.fileStore.writeGlobalFile(validation_log_location)
+    binnedqs_bam_id = job.fileStore.writeGlobalFile(binnedqs_bam_location)
 
-    # save to output directory (for development) todo: remove this
-    if trevdev:
-        job.fileStore.logToMaster('Moving {} to output dir: {}'.format(validation_ouput, config.output_dir))
-        mkdir_p(config.output_dir)
-        copy_files(file_paths=[validation_log_location], output_dir=config.output_dir)
+    # add next job
+    job.addFollowOnJobFn(validate_output, config, recalibrated_bam_id)
+    pass
+    pass
 
 
 def generate_config():
@@ -634,7 +610,7 @@ def main():
 
         # Config sanity checks
         require(config.output_dir, 'No output location specified: {}'.format(config.output_dir))
-        #todo more configuration verification checks
+        #todo more sanity checks
         # require(config.kallisto_index,
         #         'URLs not provided for Kallisto index, so there is nothing to do!')
         # require(urlparse(config.kallisto_index).scheme in SCHEMES,
