@@ -1,4 +1,4 @@
-#!/usr/bin/env python2.7
+﻿#!/usr/bin/env python2.7
 from __future__ import print_function
 
 import argparse
@@ -9,7 +9,7 @@ import sys
 import textwrap
 import tarfile
 from urlparse import urlparse
-from contextlib import closing
+import math
 
 import yaml
 from bd2k.util.files import mkdir_p
@@ -39,6 +39,8 @@ DEFAULT_MANIFEST_NAME = 'manifest-toil-topmed.tsv'
 # docker images
 #todo unlatest this
 DOCKER_SAMTOOLS = "quay.io/ucsc_cgl/samtools:latest"
+DOCKER_GATK = "quay.io/ucsc_cgl/gatk:latest"
+DOCKER_PICARD = "quay.io/ucsc_cgl/picardtools:latest"
 
 # todo temporary for development
 trevdev = True
@@ -140,6 +142,7 @@ def _files_with_suffix(urls, suffix):
     """
     return filter(lambda u: os.path.splitext(os.path.basename(urlparse(u).path))[0].endswith(suffix), urls)
 
+
 def prepare_input(job, sample, config):
     """
     input: list of files in .bam or .fq or tarballs
@@ -158,54 +161,432 @@ def prepare_input(job, sample, config):
     config = argparse.Namespace(**vars(config))
     config.cores = min(config.maxCores, multiprocessing.cpu_count())
     uuid, file_type, paired, urls = sample
+    config.uuid = uuid
+    config.is_paired = paired
+
+    # need to hand each url off to appropriate processing
+    bam_rvs = []
+    for url in urls:
+
+        #need to extract to fq
+        if file_type == 'bam':
+            job.fileStore.logToMaster("Spawning job to handle {}".format(url))
+            # this job extracts the bam into fq files, gets a read pair, then aligns
+            bam_rv = job.addChildJobFn(extract_bam, config, url).rv()
+            bam_rvs.append(bam_rv)
+        elif file_type == 'tar':
+            # tar_path = os.path.join(work_dir, os.path.basename(url))
+            # download_url(job, url=url, work_dir=work_dir)
+            # subprocess.check_call(['tar', '-xvf', tar_path, '-C', fastq_location])
+            # os.remove(tar_path)
+            #todo: how to specify read group?
+            raise UserError("ZIP not implemented")
+        # just need to download
+        elif file_type == 'tar':
+            # download_url(job, url=url, work_dir=fastq_location)
+            #todo: how to specify read group?
+            raise UserError("FQ not implemented")
+        # should never happen
+        else:
+            raise UserError('PROGRAMMER ERROR: URL "{}" with type "{}" did not match expected cases for preprocessing'
+                            .format(url, file_type))
+
+    job.addFollowOnJobFn(merge_sam_files, config, bam_rvs)
+
+def extract_bam(job, config, bam_url):
+    work_dir = job.fileStore.getLocalTempDir()
+    # download bam
+    download_url(job, url=bam_url, work_dir=work_dir)
+    filename = os.path.basename(bam_url)
+
+    # get readgroup header
+    readgroup_header = None
+    headers_filename = config.uuid + "_headers.txt"
+    #todo: dockerize this
+    # cmd = ["view", "-H", os.path.join("/data", filename), ">", "{}".format(os.path.join("/data", headers_filename))]
+    # job.fileStore.logToMaster("Running {} with parameters: {}".format(DOCKER_SAMTOOLS, cmd))
+    # dockerCall(job, tool=DOCKER_SAMTOOLS,
+    #            workDir=work_dir, parameters=cmd)
+
+    headers_file = os.path.join(work_dir, headers_filename)
+    headers_cmd = ["samtools", "view", "-H", os.path.join(work_dir, filename)]
+    job.fileStore.logToMaster("Running command: {}".format(headers_cmd))
+    with open(headers_file, 'w') as f:
+        p = subprocess.Popen(headers_cmd, stdout=f)
+    p.wait()
+    # read file
+    if not os.path.isfile(headers_file):
+        raise UserError("Found no headers for {}".format(filename))
+    with open(headers_file, 'r') as f:
+        for l in f:
+            if l.startswith("@RG"):
+                # check for multiple @RG headers
+                if readgroup_header is not None and l != readgroup_header:
+                    raise UserError("Found multiple @RG headers for file \"{}\": \"{}\" and \"{}\""
+                                    .format(filename, readgroup_header, l.rstrip()))
+                readgroup_header = l.rstrip()
+    if readgroup_header is None:
+        raise UserError("Found no @RG header for file \"{}\"".format(filename))
+
+    # prep for extraction into FQ
+    # fastq_files=[]
+    # fastq_params = ["fastq"]
+    # if config.is_paired:
+    #     fastq_files.append("{}_1.fq".format(filename))
+    #     fastq_files.append("{}_2.fq".format(filename))
+    #     fastq_params.extend(["-1", "{}".format(fastq_files[0]),
+    #                        "-2", os.path.join(work_dir, fastq_files[1]),
+    #                        "-0", os.path.join(work_dir, "{}_unpaired.bam".format(filename))])
+    # else:
+    #     fastq_files.append("{}.fq".format(filename))
+    #     fastq_params.extend(["-1", os.path.join(work_dir, fastq_files[0])])
+    # fastq_params.extend([os.path.join(work_dir, filename)])
+    # # extract
+    # #todo: dockerize this
+    # job.fileStore.logToMaster("Running {} with params: {}".format(fastq_params))
+    # subprocess.check_call(fastq_params)
+
+    # prep for extraction into FQ
+    fastq_files=[]
+    docker_params = ["fastq"]
+    if config.is_paired:
+        fastq_files.append("{}_1.fq".format(filename))
+        fastq_files.append("{}_2.fq".format(filename))
+        docker_params.extend(["-1", "{}".format(fastq_files[0]),
+                            "-2", os.path.join("/data", fastq_files[1]),
+                            "-0", os.path.join("/data", "{}_unpaired.bam".format(filename))])
+    else:
+        fastq_files.append("{}.fq".format(filename))
+        docker_params.extend(["-1", os.path.join("/data", fastq_files[0])])
+    docker_params.extend([os.path.join("/data", filename)])
+    # extract
+    job.fileStore.logToMaster("Running {} with parameters: {}".format(DOCKER_SAMTOOLS, docker_params))
+    dockerCall(job, tool=DOCKER_SAMTOOLS,
+               workDir=work_dir, parameters=docker_params)
+
+    # validate the unpaired reads
+    unpaired_size = os.stat(os.path.join(work_dir, "{}_unpaired.bam".format(filename))).st_size
+    if unpaired_size != 0:
+        # todo throw usererror?
+        job.fileStore.logToMaster("Got non-zero length ({}) for unmatched reads in file \"{}\""
+                                  .format(unpaired_size, filename))
+
+    # save output
+    output_file_ids = [job.fileStore.writeGlobalFile(os.path.join(work_dir, fq)) for fq in fastq_files]
+
+    # save to output directory (for development) todo: remove this
+    if trevdev:
+        job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(fastq_files, config.output_dir))
+        mkdir_p(config.output_dir)
+        copy_files(file_paths=[os.path.join(work_dir, fq) for fq in fastq_files], output_dir=config.output_dir)
+
+    # invoke alignment
+    return job.addChildJobFn(perform_alignment, config, filename, output_file_ids, readgroup_header).rv()
+
+
+def perform_alignment(job, config, original_filename, input_fq_files, read_group_header):
+    """
+    input: one (paired potentially fastq file
+    run the bwa-mem container situation
+    output: bam file?
+    """
+    job.fileStore.logToMaster("Performing alignment on {} with {} input"
+                              .format(original_filename, "single" if len(input_fq_files) == 1 else "paired"))
+    work_dir = job.fileStore.getLocalTempDir()
+    output_file_name=config.uuid+"_"+original_filename+".bam"
+
+    #fix readgroup
+    read_group_pieces = read_group_header.split("\t")
+    read_group_header = "\\t".join(read_group_pieces)
+
+    # get reference files
+    reference_location = download_reference(work_dir, "the config'd reference")
+
+    # get fq files
+    fq_files = None
+    # single read
+    if len(input_fq_files) == 1:
+        fq_files = [job.fileStore.readGlobalFile(input_fq_files[0], os.path.join(work_dir, original_filename + ".fq"))]
+    # paired read
+    elif len(input_fq_files) == 2:
+        fq_files = [job.fileStore.readGlobalFile(input_fq_files[0], os.path.join(work_dir, original_filename + ".R1.fq")),
+                    job.fileStore.readGlobalFile(input_fq_files[1], os.path.join(work_dir, original_filename + ".R2.fq"))]
+    # sanity check
+    else:
+        raise UserError("Got {} fq file ids before alignment, expected 1 or 2".format(len(input_fq_files)))
+
+    #todo docker this
+    output_bam_location = os.path.join(work_dir, output_file_name)
+    # bwa
+    read_1 = fq_files[0]
+    bwa_cmd = 'bwa mem -t 4 -K 100000000 -R "{}" -Y {} {} '.format(read_group_header, reference_location, read_1)
+    if len(fq_files) > 1:
+        bwa_cmd += fq_files[1]
+    # other commands
+    samblaster_cmd = "samblaster --addMateTags"
+    samtools_sam2bam_cmd = "samtools view -Sb -"
+    samtools_sort_cmd = "samtools sort -T {} -o {}".format(config.uuid + ".sorting", output_bam_location)
+    # construct command
+    cmd_string = bwa_cmd + " | " + samblaster_cmd + " | " + samtools_sam2bam_cmd + " | " + samtools_sort_cmd
+    job.fileStore.logToMaster("Running command: {}".format(cmd_string))
+    # run the command
+    subprocess.check_call(cmd_string, shell=True)
+    # sanity check
+    if not os.path.isfile(output_bam_location):
+        raise UserError('Aligned BAM file "{}" does not exist'.format(output_bam_location))
+
+    # save to output directory (for development) todo: remove this
+    if trevdev:
+        job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(output_bam_location, config.output_dir))
+        mkdir_p(config.output_dir)
+        copy_files(file_paths=[output_bam_location], output_dir=config.output_dir)
+
+    # it worked
+    aligned_sam_id = job.fileStore.writeGlobalFile(output_bam_location)
+
+    # add next job
+    return aligned_sam_id
+
+def merge_sam_files(job, config, aligned_bam_ids):
+    """
+    input: bam ids to mere
+    merge
+    output: bam
+    """
+    #setup
+    output_file_name = config.uuid + ".merged.bam"
+    job.fileStore.logToMaster("Merging {} BAM files".format(len(aligned_bam_ids)))
+    work_dir = job.fileStore.getLocalTempDir()
+
+    # read file
+    bam_dir = os.path.join(work_dir, "bam")
+    docker_bam_names = []
+    os.mkdir(bam_dir)
+    digits = int(math.log10(len(aligned_bam_ids))) + 1
+    idx = 0
+    for bam in aligned_bam_ids:
+        bam_name = config.uuid + '.{0:0{digits}}.bam'.format(idx, digits=digits)
+        job.fileStore.readGlobalFile(bam, os.path.join(bam_dir, bam_name))
+        docker_bam_names.append(os.path.join("/data", "bam", bam_name))
+        idx += 1
+
+    # Call docker image
+    # -c/-p help conflicting RG or PG headers
+    params = ["merge", "-c", "-p", os.path.join("/data", output_file_name)]
+    params.extend(docker_bam_names)
+    job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_SAMTOOLS, params))
+    dockerCall(job, tool=DOCKER_SAMTOOLS,
+               workDir=work_dir, parameters=params)
+
+    # sanity check
+    output_file_location = os.path.join(work_dir, output_file_name)
+    if not os.path.isfile(output_file_location):
+        raise UserError('Merged BAM file "{}" does not exist'.format(output_file_location))
+
+    # save to output directory (for development) todo: remove this
+    if trevdev:
+        job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(output_file_location, config.output_dir))
+        mkdir_p(config.output_dir)
+        copy_files(file_paths=[output_file_location], output_dir=config.output_dir)
+
+    # save output
+    output_id = job.fileStore.writeGlobalFile(output_file_location)
+
+    # add next job
+    job.addFollowOnJobFn(mark_duplicates, config, output_id)
+
+#todo do this better
+def _filter_header(job, config, work_dir, filename, filter_function):
+    header_orig_name = "{}.header_orig.txt".format(filename)
+    header_new_name = "{}.header_adjusted.txt".format(filename)
+    tmp_name = "{}.tmp".format(filename)
+    job.fileStore.logToMaster("Stripping PG from header for {}".format(filename))
+    # get header
+    params = ["view", "-H", "-o", os.path.join("/data", header_orig_name), os.path.join("/data", filename)]
+    dockerCall(job, tool=DOCKER_SAMTOOLS, workDir=work_dir, parameters=params)
+    # modify header
+    with open(os.path.join(work_dir, header_orig_name), 'r') as input:
+        with open(os.path.join(work_dir, header_new_name), 'w') as output:
+            for line in input:
+                if filter_function(line):
+                    output.write(line)
+    # reheader
+    params = ["reheader", "-P", os.path.join("/data", header_new_name), os.path.join("/data", filename), ">{}"]
+    dockerCall(job, tool=DOCKER_SAMTOOLS, workDir=work_dir, parameters=params)
+    # save to output directory (for development) todo: remove this
+    if trevdev:
+        output = [os.path.join(work_dir, header_orig_name),os.path.join(work_dir, header_new_name),
+                  os.path.join(work_dir, tmp_name)]
+        job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(output, config.output_dir))
+        mkdir_p(config.output_dir)
+        copy_files(file_paths=output, output_dir=config.output_dir)
+
+def mark_duplicates(job, config, aligned_bam_id):
+    """
+    input: bam
+    run picard for duplicate marking
+    output: bam
+    """
+    #prep
+    duped_bam_name = config.uuid + ".duped.bam"
+    deduped_bam_name = config.uuid + ".deduped.bam"
+    job.fileStore.logToMaster('Marking duplicates on {}'.format(duped_bam_name))
+    work_dir = job.fileStore.getLocalTempDir()
+
+    # read file
+    job.fileStore.readGlobalFile(aligned_bam_id, os.path.join(work_dir, duped_bam_name))
+
+    # Call docker image
+    # picard MarkDuplicates I={} O={} M={} ASSUME_SORT_ORDER=coordinate
+    metrics_filename = config.uuid + ".deduplication_metrics.txt"
+    params = ["MarkDuplicates",
+              "I={}".format(os.path.join("/data", duped_bam_name)),
+              "O={}".format(os.path.join("/data", deduped_bam_name)),
+              "M={}".format(os.path.join("/data", metrics_filename)),
+              "ASSUME_SORT_ORDER=coordinate"]
+    job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_PICARD, params))
+    dockerCall(job, tool=DOCKER_PICARD,
+               workDir=work_dir, parameters=params)
+
+    # verify output
+    deduped_bam_location = os.path.join(work_dir, deduped_bam_name)
+    metrics_location = os.path.join(work_dir, metrics_filename)
+    save_metrics = False
+    if not os.path.isfile(metrics_location):
+        job.fileStore.logToMaster("Deduplication metrics file was not found: {}".format(metrics_location))
+    elif os.stat(os.path.join(metrics_location)).st_size != 0:
+        #todo user error?  just save it?
+        job.fileStore.logToMaster("Deduplication metrics file has nonzero size: {}".format(metrics_location))
+        save_metrics = True
+
+    # sanity check
+    if not os.path.isfile(deduped_bam_location):
+        raise UserError('Deduplicated BAM file "{}" does not exist'.format(deduped_bam_location))
+    deduped_bam_id = job.fileStore.writeGlobalFile(deduped_bam_location)
+
+    # save to output directory (for development) todo: remove this
+    if trevdev:
+        outfiles = [deduped_bam_location]
+        if save_metrics:
+            outfiles.append(metrics_location)
+        job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(outfiles, config.output_dir))
+        mkdir_p(config.output_dir)
+        copy_files(file_paths=outfiles, output_dir=config.output_dir)
+
+    # add next job
+    job.addFollowOnJobFn(recalibrate_quality_scores, config, deduped_bam_id)
+
+
+def recalibrate_quality_scores(job, config, deduped_bam_id):
+    """
+
+    """
+    #prep
+    calibrated_bam_name = config.uuid + ".calibrated.bam"
+    recalibrated_bam_name = config.uuid + ".recalibrated.bam"
+    job.fileStore.logToMaster('Recalibrating quality scores on {}'.format(calibrated_bam_name))
+
+    # read file
+    work_dir = job.fileStore.getLocalTempDir()
+    job.fileStore.readGlobalFile(deduped_bam_id, os.path.join(work_dir, calibrated_bam_name))
+
+    # get reference variants
+    reference_vcfs = []
+    for reference in ["Homo_sapiens_assembly38.dbsnp138.vcf", "Mills_and_1000G_gold_standard.indels.hg38.vcf.gz",
+                      "Homo_sapiens_assembly38.known_indels.vcf.gz"]:
+        reference_vcfs.append(download_variants(work_dir, reference))
+
+    # BaseRecalibrator
+    # tool:
+    # -R ${ref_fasta} \
+    #     - I ${input_bam} \
+    #          - O ${recalibration_report_filename} \
+    #               - knownSites
+    # "Homo_sapiens_assembly38.dbsnp138.vcf" \
+    # - knownSites “Mills_and_1000G_gold_standard.indels.hg38.vcf.gz
+    # " \
+    # -knownSites “Homo_sapiens_assembly38.known_indels.vcf.gz”
+
+
+    # Call docker image
+    #todo the real params
+    params = [os.path.join("/data", calibrated_bam_name)]
+    job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_GATK, params))
+    dockerCall(job, tool=DOCKER_GATK,
+               workDir=work_dir, parameters=params)
+
+    recalibrated_bam_location = os.path.join(work_dir, recalibrated_bam_name)
+    # sanity check
+    if not os.path.isfile(recalibrated_bam_location):
+        raise UserError('Recalibrated quality scores BAM file "{}" does not exist'.format(recalibrated_bam_location))
+    recalibrated_bam_id = job.fileStore.writeGlobalFile(recalibrated_bam_location)
+
+    # save to output directory (for development) todo: remove this
+    if trevdev:
+        job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(recalibrated_bam_location, config.output_dir))
+        mkdir_p(config.output_dir)
+        copy_files(file_paths=[recalibrated_bam_location], output_dir=config.output_dir)
+
+    # add next job
+    job.addFollowOnJobFn(bin_quality_scores, config, recalibrated_bam_id)
+
+
+def bin_quality_scores(job, config, recalibrated_bam_id):
+    """
+
+    """
+    #prep
+    fullqs_bam_name = config.uuid + ".fullqs.bam"
+    binnedqs_bam_name = config.uuid + ".binnedqs.bam"
+    job.fileStore.logToMaster('Binning quality scores on {}'.format(fullqs_bam_name))
+
+    # read file
+    work_dir = job.fileStore.getLocalTempDir()
+    job.fileStore.readGlobalFile(recalibrated_bam_id, os.path.join(work_dir, fullqs_bam_name))
+
+    # call out to docker
+    #todo the real params
+    params = [os.path.join("/data", fullqs_bam_name)]
+    job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_GATK, params))
+    dockerCall(job, tool=DOCKER_GATK,
+               workDir=work_dir, parameters=params)
+
+    binnedqs_bam_location = os.path.join(work_dir, binnedqs_bam_name)
+    # sanity check
+    if not os.path.isfile(binnedqs_bam_location):
+        raise UserError('Binned-quality-scores BAM file "{}" does not exist'.format(binnedqs_bam_location))
+    binnedqs_bam_id = job.fileStore.writeGlobalFile(binnedqs_bam_location)
+
+    # save to output directory (for development) todo: remove this
+    if trevdev:
+        job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(binnedqs_bam_location, config.output_dir))
+        mkdir_p(config.output_dir)
+        copy_files(file_paths=[binnedqs_bam_location], output_dir=config.output_dir)
+
+    # add next job
+    job.addFollowOnJobFn(validate_output, config, recalibrated_bam_id)
+    pass
+
+
+def concatinate_fq_files(job, sample, config):
+    """
+    todo: I don't think this is needed
+    """
+
+    # prepare
+    config = argparse.Namespace(**vars(config))
+    config.cores = min(config.maxCores, multiprocessing.cpu_count())
+    uuid, file_type, paired, urls = sample
     is_paired = paired == "paired"
     config.uuid = uuid
     work_dir = job.fileStore.getLocalTempDir()
     fastq_location = os.path.join(work_dir, "fastq")
     os.mkdir(fastq_location)
-    bam_location = os.path.join(work_dir, "bam")
-    os.mkdir(bam_location)
 
-    # first, get all files
-    for url in urls:
-        #need to untar them (for .tar, .tar.gz, .fq.gz, .fastq.gz)
-        if url.endswith(TAR_FORMATS):
-            #todo: verify this works with all the tar formats (including fq stuff) b
-            tar_path = os.path.join(work_dir, os.path.basename(url))
-            download_url(job, url=url, work_dir=work_dir)
-            subprocess.check_call(['tar', '-xvf', tar_path, '-C', fastq_location])
-            os.remove(tar_path)
-        #need to extract to fq
-        elif file_type == 'bam':
-            # download bam
-            download_url(job, url=url, work_dir=bam_location)
-            # prep for extraction
-            filename = os.path.basename(url)
-            parameters = ["fastq"]
-            if is_paired:
-                parameters.extend(["-1", "/data/fastq/{}_1.fq".format(filename),
-                                   "-2", "/data/fastq/{}_2.fq".format(filename),
-                                   "-0", "/data/bam/{}_unpaired.bam".format(filename)])
-            else:
-                parameters.extend(["-1", "/data/fastq/{}.fq".format(filename)])
-            parameters.extend(["/data/bam/{}".format(filename)])
-            # extract
-            job.fileStore.logToMaster("Running {} with parameters: {}".format(DOCKER_SAMTOOLS, parameters))
-            dockerCall(job, tool=DOCKER_SAMTOOLS,
-                       workDir=work_dir, parameters=parameters)
-            # validate the unpaired reads
-            unpaired_size = os.stat(os.path.join(bam_location, "{}_unpaired.bam".format(filename))).st_size
-            if unpaired_size != 0:
-                #todo throw usererror?
-                job.fileStore.logToMaster("Got non-zero length ({}) for unmatched reads in file \"{}\""
-                                          .format(unpaired_size, filename))
-        # just need to download
-        elif url.endswith(FQ_FORMATS) and not url.endswith(TAR_FORMATS):
-            download_url(job, url=url, work_dir=fastq_location)
-        # should never happen
-        else:
-            raise UserError('PROGRAMMER ERROR: URL "{}" with type "{}" did not match expected cases for downloading!'
-                            .format(url, file_type))
+    # todo: download all files to fastq_location
+    # this probably does not include any of the 'bam' files
+    # probably a list of fq files is passed into this
+    raise UserError("not implemented")
 
     # now we need to concatinate them together
     all_fq_files = os.listdir(fastq_location)
@@ -215,24 +596,24 @@ def prepare_input(job, sample, config):
 
     # for handling paired sample data
     if is_paired:
-        #prep
+        # prep
         front_files = _files_with_suffix(all_fq_files, PAIRED_FRONT_SUFFIXES)
         back_files = _files_with_suffix(all_fq_files, PAIRED_BACK_SUFFIXES)
         front_files.sort()
         back_files.sort()
 
-        #sanity check same number of files
-        if len(front_files ) != len(back_files):
+        # sanity check same number of files
+        if len(front_files) != len(back_files):
             raise UserError('Found inconsistent number of files ({} / {}) for "paired" input: {}'
                             .format(len(front_files), len(back_files), [os.path.basename(f) for f in all_fq_files]))
-        #sanity check not missing any files
+        # sanity check not missing any files
         for fq in all_fq_files:
             if fq not in front_files and fq not in back_files:
                 raise UserError('Found fq file without suffix "_1"/"_2" or "R1"/"R2" for "paired" input: {}'.format(fq))
-        #sanity check all files have a pair and are of the same size
+        # sanity check all files have a pair and are of the same size
         total_f_size = 0
         total_b_size = 0
-        for f,b in zip(front_files, back_files):
+        for f, b in zip(front_files, back_files):
             f_size = os.stat(os.path.join(fastq_location, f)).st_size
             b_size = os.stat(os.path.join(fastq_location, f)).st_size
             for fs, bs in zip(PAIRED_FRONT_SUFFIXES, PAIRED_BACK_SUFFIXES):
@@ -265,17 +646,17 @@ def prepare_input(job, sample, config):
         # another sanity check
         if os.stat(front_outfile).st_size != total_f_size:
             job.fileStore.logToMaster('File size {} from concatinated front files does not match expected value {}'
-                  .format(os.stat(front_outfile).st_size, total_f_size))
+                                      .format(os.stat(front_outfile).st_size, total_f_size))
         if os.stat(back_outfile).st_size != total_b_size:
             job.fileStore.logToMaster('File size {} from concatinated back files does not match expected value {}'
-                  .format(os.stat(back_outfile).st_size, total_b_size))
+                                      .format(os.stat(back_outfile).st_size, total_b_size))
 
         # save to output directory (for development) todo: remove this
         if trevdev:
-            job.fileStore.logToMaster('Moving {} to output dir: {}'.format(front_outfile, config.output_dir))
+            job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(front_outfile, config.output_dir))
             mkdir_p(config.output_dir)
             copy_files(file_paths=[front_outfile], output_dir=config.output_dir)
-            job.fileStore.logToMaster('Moving {} to output dir: {}'.format(back_outfile, config.output_dir))
+            job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(back_outfile, config.output_dir))
             copy_files(file_paths=[back_outfile], output_dir=config.output_dir)
 
         # save for next step
@@ -301,7 +682,7 @@ def prepare_input(job, sample, config):
 
         # save to output directory (for development) todo: remove this
         if trevdev:
-            job.fileStore.logToMaster('Moving {} to output dir: {}'.format(output_file, config.output_dir))
+            job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(output_file, config.output_dir))
             mkdir_p(config.output_dir)
             copy_files(file_paths=[outfile], output_dir=config.output_dir)
 
@@ -317,128 +698,12 @@ def prepare_input(job, sample, config):
     job.addFollowOnJobFn(perform_alignment, config, output)
 
 
-def perform_alignment(job, config, fq_file_ids):
-    """
-    input: one (paired potentially fastq file
-    run the bwa-mem container situation
-    output: bam file?
-    """
-    aligned_bam_name = config.uuid + "_aligned.bam"
-    job.fileStore.logToMaster("Performing alignment with {} input"
-                              .format("single" if len(fq_file_ids) == 1 else "paired"))
-    work_dir = job.fileStore.getLocalTempDir()
-    fq_files = None
-    # single read
-    if len(fq_file_ids == 1):
-        fq_files = [job.fileStore.readGlobalFile(fq_file_ids[0], os.path.join(work_dir, config.uuid + ".fq"))]
-    # paired read
-    elif len(fq_file_ids == 2):
-        fq_files = [job.fileStore.readGlobalFile(fq_file_ids[0], os.path.join(work_dir, config.uuid + "_1.fq")),
-                    job.fileStore.readGlobalFile(fq_file_ids[0], os.path.join(work_dir, config.uuid + "_2.fq"))]
-    # sanity check
-    else:
-        raise UserError("Got {} fq file ids before alignment, expected 1 or 2".format(len(fq_file_ids)))
-
-    #todo call out to docker container
-
-    aligned_bam_location = os.path.join(work_dir, aligned_bam_name)
-    # sanity check
-    if not os.path.isfile(aligned_bam_location):
-        raise UserError('Aligned BAM file "{}" does not exist'.format(aligned_bam_location))
-
-    aligned_bam_id = job.fileStore.writeGlobalFile(aligned_bam_location)
-
-    # add next job
-    job.addFollowOnJobFn(mark_duplicates, config, aligned_bam_id)
-
-
-def mark_duplicates(job, config, aligned_bam_id):
-    """
-    input: bam
-    run picard for duplicate marking
-    output: bam
-    """
-    #prep
-    aligned_bam_name = config.uuid + "_aligned.bam"
-    deduped_bam_name = config.uuid + "_deduped.bam"
-    job.fileStore.logToMaster('Marking duplicates on {}'.format(aligned_bam_name))
-
-    # read file
-    work_dir = job.fileStore.getLocalTempDir()
-    job.fileStore.readGlobalFile(aligned_bam_id, os.path.join(work_dir, aligned_bam_name))
-
-    #todo call out to picard
-
-    deduped_bam_location = os.path.join(work_dir, deduped_bam_name)
-    # sanity check
-    if not os.path.isfile(deduped_bam_location):
-        raise UserError('Deduplicated BAM file "{}" does not exist'.format(deduped_bam_location))
-
-    deduped_bam_id = job.fileStore.writeGlobalFile(deduped_bam_location)
-
-    # add next job
-    job.addFollowOnJobFn(recalibrate_quality_scores, config, deduped_bam_id)
-
-
-def recalibrate_quality_scores(job, config, deduped_bam_id):
-    """
-
-    """
-    #prep
-    deduped_bam_name = config.uuid + "_deduped.bam"
-    recalibrated_bam_name = config.uuid + "_recalibrated.bam"
-    job.fileStore.logToMaster('Recalibrating quality scores on {}'.format(deduped_bam_name))
-
-    # read file
-    work_dir = job.fileStore.getLocalTempDir()
-    job.fileStore.readGlobalFile(deduped_bam_id, os.path.join(work_dir, deduped_bam_name))
-
-    #todo call out to GATK
-
-    recalibrated_bam_location = os.path.join(work_dir, recalibrated_bam_name)
-    # sanity check
-    if not os.path.isfile(recalibrated_bam_location):
-        raise UserError('Recalibrated quality scores BAM file "{}" does not exist'.format(recalibrated_bam_location))
-
-    recalibrated_bam_id = job.fileStore.writeGlobalFile(recalibrated_bam_location)
-
-    # add next job
-    job.addFollowOnJobFn(bin_quality_scores, config, recalibrated_bam_id)
-
-
-def bin_quality_scores(job, config, recalibrated_bam_id):
+def validate_output(job, config, recalibrated_bam_id):
     """
 
     """
     #prep
     recalibrated_bam_name = config.uuid + "_recalibrated.bam"
-    binnedqs_bam_name = config.uuid + "_binnedqs.bam"
-    job.fileStore.logToMaster('Binning quality scores on {}'.format(recalibrated_bam_name))
-
-    # read file
-    work_dir = job.fileStore.getLocalTempDir()
-    job.fileStore.readGlobalFile(recalibrated_bam_id, os.path.join(work_dir, recalibrated_bam_name))
-
-    #todo call out to GATK
-
-    binnedqs_bam_location = os.path.join(work_dir, binnedqs_bam_name)
-    # sanity check
-    if not os.path.isfile(binnedqs_bam_location):
-        raise UserError('Binned-quality-scores BAM file "{}" does not exist'.format(binnedqs_bam_location))
-
-    binnedqs_bam_id = job.fileStore.writeGlobalFile(binnedqs_bam_location)
-
-    # add next job
-    job.addFollowOnJobFn(validate_output, config, recalibrated_bam_id)
-    pass
-
-
-def validate_output(job, config, binnedqs_bam_id):
-    """
-
-    """
-    #prep
-    binnedqs_bam_name = config.uuid + "_binnedqs.bam"
     validated_bam_name = config.uuid + ".bam"
     job.fileStore.logToMaster('Validating BAM on {}'.format(recalibrated_bam_name))
 
@@ -448,7 +713,7 @@ def validate_output(job, config, binnedqs_bam_id):
 
     #todo call out to GATK
 
-    binnedqs_bam_location = os.path.join(work_dir, binnedqs_bam_name)
+    binnedqs_bam_location = os.path.join(work_dir, validated_bam_name)
     # sanity check
     if not os.path.isfile(binnedqs_bam_location):
         raise UserError('Binned-quality-scores BAM file "{}" does not exist'.format(binnedqs_bam_location))
@@ -458,7 +723,20 @@ def validate_output(job, config, binnedqs_bam_id):
     # add next job
     job.addFollowOnJobFn(validate_output, config, recalibrated_bam_id)
     pass
-    pass
+
+
+def download_reference(work_dir, reference_location):
+    # todo download reference
+    if trevdev:
+        return "/mnt/trevor/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa"
+    raise UserError("download_reference not implemented")
+
+
+def download_variants(work_dir, variant_location):
+    # todo download reference
+    if trevdev:
+        return os.path.join("/mnt/trevor/reference", variant_location)
+    raise UserError("download_variants not implemented")
 
 
 def generate_config():
