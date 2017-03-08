@@ -10,6 +10,8 @@ import textwrap
 import tarfile
 from urlparse import urlparse
 import math
+import shutil
+import glob
 
 import yaml
 from bd2k.util.files import mkdir_p
@@ -300,7 +302,7 @@ def perform_alignment(job, config, original_filename, input_fq_files, read_group
     read_group_header = "\\t".join(read_group_pieces)
 
     # get reference files
-    reference_location = download_reference(work_dir, "the config'd reference")
+    reference_location = download_reference(work_dir, "the config'd reference") #todo
 
     # get fq files
     fq_files = None
@@ -395,31 +397,6 @@ def merge_sam_files(job, config, aligned_bam_ids):
     # add next job
     job.addFollowOnJobFn(mark_duplicates, config, output_id)
 
-#todo do this better
-def _filter_header(job, config, work_dir, filename, filter_function):
-    header_orig_name = "{}.header_orig.txt".format(filename)
-    header_new_name = "{}.header_adjusted.txt".format(filename)
-    tmp_name = "{}.tmp".format(filename)
-    job.fileStore.logToMaster("Stripping PG from header for {}".format(filename))
-    # get header
-    params = ["view", "-H", "-o", os.path.join("/data", header_orig_name), os.path.join("/data", filename)]
-    dockerCall(job, tool=DOCKER_SAMTOOLS, workDir=work_dir, parameters=params)
-    # modify header
-    with open(os.path.join(work_dir, header_orig_name), 'r') as input:
-        with open(os.path.join(work_dir, header_new_name), 'w') as output:
-            for line in input:
-                if filter_function(line):
-                    output.write(line)
-    # reheader
-    params = ["reheader", "-P", os.path.join("/data", header_new_name), os.path.join("/data", filename), ">{}"]
-    dockerCall(job, tool=DOCKER_SAMTOOLS, workDir=work_dir, parameters=params)
-    # save to output directory (for development) todo: remove this
-    if trevdev:
-        output = [os.path.join(work_dir, header_orig_name),os.path.join(work_dir, header_new_name),
-                  os.path.join(work_dir, tmp_name)]
-        job.fileStore.logToMaster('TREVDEV: Moving {} to output dir: {}'.format(output, config.output_dir))
-        mkdir_p(config.output_dir)
-        copy_files(file_paths=output, output_dir=config.output_dir)
 
 def mark_duplicates(job, config, aligned_bam_id):
     """
@@ -484,6 +461,7 @@ def recalibrate_quality_scores(job, config, deduped_bam_id):
     #prep
     calibrated_bam_name = config.uuid + ".calibrated.bam"
     recalibrated_bam_name = config.uuid + ".recalibrated.bam"
+    recalibration_report_name = config.uuid + ".recalibration.txt"
     job.fileStore.logToMaster('Recalibrating quality scores on {}'.format(calibrated_bam_name))
 
     # read file
@@ -491,34 +469,51 @@ def recalibrate_quality_scores(job, config, deduped_bam_id):
     job.fileStore.readGlobalFile(deduped_bam_id, os.path.join(work_dir, calibrated_bam_name))
 
     # get reference variants
-    reference_vcfs = []
-    for reference in ["Homo_sapiens_assembly38.dbsnp138.vcf", "Mills_and_1000G_gold_standard.indels.hg38.vcf.gz",
+    reference_dir = os.path.join(work_dir, "references")
+    os.mkdir(reference_dir)
+    variants = []
+    for variant in ["Homo_sapiens_assembly38.dbsnp138.vcf", "Mills_and_1000G_gold_standard.indels.hg38.vcf.gz",
                       "Homo_sapiens_assembly38.known_indels.vcf.gz"]:
-        reference_vcfs.append(download_variants(work_dir, reference))
+        variants.append(download_variant(reference_dir, variant))
+    # get the reference
+    reference_location = download_reference(reference_dir, "GRCh38_full_analysis_set_plus_decoy_hla.fa")
 
-    # BaseRecalibrator
-    # tool:
-    # -R ${ref_fasta} \
-    #     - I ${input_bam} \
-    #          - O ${recalibration_report_filename} \
-    #               - knownSites
-    # "Homo_sapiens_assembly38.dbsnp138.vcf" \
-    # - knownSites “Mills_and_1000G_gold_standard.indels.hg38.vcf.gz
-    # " \
-    # -knownSites “Homo_sapiens_assembly38.known_indels.vcf.gz”
+    # build params for docker call
+    params = ["-T", "BaseRecalibrator",
+              "-R", os.path.join("/data/references", os.path.basename(reference_location)),
+              "-I", os.path.join("/data", calibrated_bam_name),
+              "-o", os.path.join("/data", recalibration_report_name)]
+    for variant in variants:
+        params.extend(["-knownSites", os.path.join("/data/references", os.path.basename(variant))])
+    optional_params = ["--downsample_to_fraction", ".1", "-L", "chr1", "-L", "chr2", "-L", "chr3", "-L", "chr4",
+                       "-L", "chr5", "-L", "chr6", "-L", "chr7", "-L", "chr8", "-L", "chr9", "-L", "chr10",
+                       "-L", "chr11", "-L", "chr12", "-L", "chr13", "-L", "chr14", "-L", "chr15",
+                       "-L", "chr16", "-L", "chr17", "-L", "chr18", "-L", "chr19", "-L", "chr20",
+                       "-L", "chr21", "-L", "chr22", "--interval_padding", "200", "-rf", "BadCigar",
+                       "--preserve_qscores_less_than", "6",
+                       "--disable_auto_index_creation_and_locking_when_reading_rods", "--disable_bam_indexing",
+                       "--useOriginalQualities"] #todo "-nct" (num cpu threads)
 
+    params.extend(optional_params)
 
-    # Call docker image
-    #todo the real params
-    params = [os.path.join("/data", calibrated_bam_name)]
-    job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_GATK, params))
-    dockerCall(job, tool=DOCKER_GATK,
-               workDir=work_dir, parameters=params)
+    # need to do this to redirect output to a file
+    full_command = ["/opt/gatk/wrapper.sh"]
+    full_command.extend(params)
+    full_command.extend([">", os.path.join("/data", recalibrated_bam_name)])
 
+    # call docker: type(parameters) == list of lists => execute command as shell
+    job.fileStore.logToMaster("Calling {} with command: {}".format(DOCKER_GATK, full_command))
     recalibrated_bam_location = os.path.join(work_dir, recalibrated_bam_name)
+    with open(recalibrated_bam_location, 'w') as out:
+        dockerCall(job, tool=DOCKER_GATK,
+                   workDir=work_dir, parameters=params, outfile=out)
+
     # sanity check
     if not os.path.isfile(recalibrated_bam_location):
         raise UserError('Recalibrated quality scores BAM file "{}" does not exist'.format(recalibrated_bam_location))
+    if os.stat(recalibrated_bam_location).st_size == 0:
+        raise UserError('Recalibrated quality scores BAM file "{}" is empty'.format(recalibrated_bam_location))
+    # save file for next step
     recalibrated_bam_id = job.fileStore.writeGlobalFile(recalibrated_bam_location)
 
     # save to output directory (for development) todo: remove this
@@ -727,15 +722,22 @@ def validate_output(job, config, recalibrated_bam_id):
 
 def download_reference(work_dir, reference_location):
     # todo download reference
+    destination = os.path.join(work_dir, reference_location)
     if trevdev:
-        return "/mnt/trevor/reference/GRCh38_full_analysis_set_plus_decoy_hla.fa"
+        for file in glob.glob(os.path.join("/mnt/trevor/reference", reference_location[0:-2]) + "*"):
+            dest = os.path.join(work_dir, os.path.basename(file))
+            shutil.copyfile(file, dest)
+        return destination
     raise UserError("download_reference not implemented")
 
 
-def download_variants(work_dir, variant_location):
+def download_variant(work_dir, variant_location):
     # todo download reference
+    destination = os.path.join(work_dir, variant_location)
     if trevdev:
-        return os.path.join("/mnt/trevor/reference", variant_location)
+        shutil.copyfile(os.path.join("/mnt/trevor/reference", variant_location), destination)
+        return destination
+
     raise UserError("download_variants not implemented")
 
 
