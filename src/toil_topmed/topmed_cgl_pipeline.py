@@ -12,12 +12,14 @@ from urlparse import urlparse
 import math
 import shutil
 import glob
+import time
+import logging
 
 import yaml
 from bd2k.util.files import mkdir_p
 from bd2k.util.processes import which
 from toil.job import Job
-from toil.lib.docker import dockerCall
+from toil.lib.docker import dockerCall, _fixPermissions
 from toil_lib import require, UserError
 from toil_lib.files import tarball_files, copy_files
 from toil_lib.jobs import map_job
@@ -34,16 +36,24 @@ ZIP_FORMATS = ('.fq.gz', '.fastq.gz', '.tar', '.tar.gz')
 PAIRED_FRONT_SUFFIXES = ("_1", "R1")
 PAIRED_BACK_SUFFIXES = ("_2", "R2")
 
+# resource estimatin
+ALIGN_FS_TO_DSK_REQ = 6
+MERGE_FS_TO_TO_DSK_REQ = 1
+PICARD_FS_TO_TO_DSK_REQ = 1
+GATK_FS_TO_TO_DSK_REQ = 1
+CRAM_FS_TO_TO_DSK_REQ = 1
+REFERENCE_SIZE = 8 * 1024 * 1024 * 1024 #8G
+
 # filenames
 DEFAULT_CONFIG_NAME = 'config-toil-topmed.yaml'
 DEFAULT_MANIFEST_NAME = 'manifest-toil-topmed.tsv'
 
 # docker images
 #todo unlatest this
-DOCKER_SAMTOOLS = "quay.io/ucsc_cgl/samtools:latest"
+DOCKER_SAMTOOLS = "quay.io/ucsc_cgl/samtools:1.3--256539928ea162949d8a65ca5c79a72ef557ce7c"
 DOCKER_BWAKIT = "quay.io/ucsc_cgl/bwakit:latest"
-DOCKER_GATK = "quay.io/ucsc_cgl/gatk:latest"
-DOCKER_PICARD = "quay.io/ucsc_cgl/picardtools:latest"
+DOCKER_GATK = "quay.io/ucsc_cgl/gatk:3.7--e931e1ca12f6d930b755e5ac9c0c4ca266370b7b"
+DOCKER_PICARD = "quay.io/ucsc_cgl/picardtools:2.9.0--4d726c4a1386d4252a0fc72d49b1d3f5b50b1e23"
 
 # todo temporary for development
 trevdev = True
@@ -147,38 +157,39 @@ def _files_with_suffix(urls, suffix):
 
 
 def prepare_input(job, sample, config):
-    """
-    input: list of files in .bam or .fq or tarballs
-    for each input file:
-        if tarball:
-            unzip
-        if bam
-            picard sam2fq
-        ensure paird or not paired (as specified in manifest)
-    cat all fq's together
-        (this will be a big file, is this an issue?)
-    output: one (paired potentially) big fastq file
-    """
 
-    # prepare
+    # job prep
     config = argparse.Namespace(**vars(config))
-    config.cores = min(config.maxCores, multiprocessing.cpu_count())
     uuid, file_type, paired, urls = sample
     config.uuid = uuid
+    config.file_type = file_type
     config.is_paired = paired
+
+    # global resource estimation
+    estimated_input_size = config.input_file_size
+    if estimated_input_size is None:
+        raise UserError("For now, configuration parameter input-file-size is required")
+    config.cores = min(config.maxCores, multiprocessing.cpu_count())
+    config.memory = min(config.maxMemory, os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')) #todo this in a better way
+    config.base_sample_size = estimated_input_size * len(urls)
+    #todo specify
+    config.disk = min(config.maxDisk, config.base_sample_size * ALIGN_FS_TO_DSK_REQ)
+
+    # alignment resource estimation
 
     # need to hand each url off to appropriate processing
     bam_ids = []
-    fastq_ids = []
+    fastq_ids = [] #this is to track jobstore files which can be removed
     for url in urls:
+        aln_disk = estimated_input_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE
+        aln_mem = config.alignment_memory if config.alignment_memory is not None else config.memory
+        aln_cpu = config.alignment_cores if config.alignment_cores is not None else config.cores
 
         #need to extract to fq
         if file_type == 'bam':
             job.fileStore.logToMaster("Spawning job to handle {}".format(url))
-            # this job extracts the bam into fq files, gets a read pair, then aligns
-            child_job = job.addChildJobFn(extract_bam, config, url)
-            bam_ids.append(child_job.rv(0))
-            fastq_ids.append(child_job.rv(1))
+            child_job = job.addChildJobFn(perform_alignment, config, url, memory=aln_mem, cores=aln_cpu, disk=aln_disk)
+            bam_ids.append(child_job.rv())
         elif file_type == 'tar':
             # tar_path = os.path.join(work_dir, os.path.basename(url))
             # download_url(job, url=url, work_dir=work_dir)
@@ -187,7 +198,7 @@ def prepare_input(job, sample, config):
             #todo: how to specify read group?
             raise UserError("ZIP not implemented")
         # just need to download
-        elif file_type == 'tar':
+        elif file_type == 'fq':
             # download_url(job, url=url, work_dir=fastq_location)
             #todo: how to specify read group?
             raise UserError("FQ not implemented")
@@ -196,124 +207,47 @@ def prepare_input(job, sample, config):
             raise UserError('PROGRAMMER ERROR: URL "{}" with type "{}" did not match expected cases for preprocessing'
                             .format(url, file_type))
 
-    job.addFollowOnJobFn(merge_sam_files, config, bam_ids, fastq_ids)
+    job.addFollowOnJobFn(merge_sam_files, config, bam_ids, fastq_ids,
+                         memory=config.memory, cores=config.cores, disk=(config.base_sample_size * MERGE_FS_TO_TO_DSK_REQ))
 
 
-def extract_bam(job, config, bam_url):
+def perform_alignment(job, config, sample_url):
+
+    # prep
+    start = time.time()
     work_dir = job.fileStore.getLocalTempDir()
+    is_paired = config.is_paired
+
     # download bam
-    download_url(job, url=bam_url, work_dir=work_dir)
-    filename = os.path.basename(bam_url)
-
-    # get readgroup header
-    readgroup_header = None
-    headers_name = filename + ".headers.txt"
-    headers_location = os.path.join(work_dir, headers_name)
-    cmd = ["view", "-H", os.path.join("/data", filename)]
-    job.fileStore.logToMaster("Running {} with parameters: {}".format(DOCKER_SAMTOOLS, cmd))
-    with open(headers_location, 'w') as file:
-        dockerCall(job, tool=DOCKER_SAMTOOLS, workDir=work_dir, parameters=cmd, outfile=file)
-
-    # read file
-    if not os.path.isfile(headers_location):
-        raise UserError("Found no headers for {}".format(filename))
-    with open(headers_location, 'r') as f:
-        for l in f:
-            if l.startswith("@RG"):
-                # check for multiple @RG headers
-                if readgroup_header is not None and l != readgroup_header:
-                    raise UserError("Found multiple @RG headers for file \"{}\": \"{}\" and \"{}\""
-                                    .format(filename, readgroup_header, l.rstrip()))
-                readgroup_header = l.rstrip()
-    if readgroup_header is None:
-        raise UserError("Found no @RG header for file \"{}\"".format(filename))
-
-    # prep for extraction into FQ
-    fastq_files=[]
-    docker_params = ["fastq"]
-    if config.is_paired:
-        fastq_files.append("{}_1.fq".format(filename))
-        fastq_files.append("{}_2.fq".format(filename))
-        docker_params.extend(["-1", "{}".format(fastq_files[0]),
-                            "-2", os.path.join("/data", fastq_files[1]),
-                            "-0", os.path.join("/data", "{}_unpaired.bam".format(filename))])
-    else:
-        fastq_files.append("{}.fq".format(filename))
-        docker_params.extend(["-1", os.path.join("/data", fastq_files[0])])
-    docker_params.extend([os.path.join("/data", filename)])
-    # extract
-    job.fileStore.logToMaster("Running {} with parameters: {}".format(DOCKER_SAMTOOLS, docker_params))
-    dockerCall(job, tool=DOCKER_SAMTOOLS,
-               workDir=work_dir, parameters=docker_params)
-
-    # validate the unpaired reads
-    unpaired_size = os.stat(os.path.join(work_dir, "{}_unpaired.bam".format(filename))).st_size
-    if unpaired_size != 0:
-        # todo throw usererror?
-        job.fileStore.logToMaster("Got non-zero length ({}) for unmatched reads in file \"{}\""
-                                  .format(unpaired_size, filename))
-
-    # save output
-    [subprocess.check_call(['chmod', '+w', os.path.join(work_dir, fq)]) for fq in fastq_files]
-    output_file_ids = [job.fileStore.writeGlobalFile(os.path.join(work_dir, fq)) for fq in fastq_files]
-
-    # save to output directory (for development)
-    if config.save_intermediate_files:
-        job.fileStore.logToMaster('Moving {} to output dir: {}'.format(fastq_files, config.output_dir))
-        copy_files(file_paths=[os.path.join(work_dir, fq) for fq in fastq_files], output_dir=config.output_dir)
-
-    # invoke alignment
-    return job.addChildJobFn(perform_alignment, config, filename, output_file_ids, readgroup_header).rv()
-
-
-
-
-def perform_alignment(job, config, original_filename, input_fq_files, read_group_header):
-    """
-    input: one (paired potentially fastq file
-    run the bwa-mem container situation
-    output: bam file?
-    """
+    download_url(job, url=sample_url, work_dir=work_dir)
+    filename = os.path.basename(sample_url)
+    output_filename=config.uuid+"."+filename
+    if not os.path.isfile(os.path.join(work_dir, filename)):
+        raise UserError("Failed to download {}".format(sample_url))
 
     job.fileStore.logToMaster("Performing alignment on {} with {} input"
-                              .format(original_filename, "single" if len(input_fq_files) == 1 else "paired"))
-    work_dir = job.fileStore.getLocalTempDir()
-    output_file_name=config.uuid+"_"+original_filename
+                              .format(filename, "single" if not is_paired else "paired"))
 
-    #fix readgroup
-    read_group_pieces = read_group_header.split("\t")
-    read_group_header = "\\t".join(read_group_pieces)
+    # get fq files from bam
+    fq_files, read_group_header = extract_fastq_files_from_bam(job, work_dir, filename, is_paired)
 
     # get reference files
-    #todo get from config
-    reference_location = download_reference(work_dir, "GRCh38_full_analysis_set_plus_decoy_hla.fa")
-
-    # get fq files
-    fq_files = None
-    # single read
-    if len(input_fq_files) == 1:
-        fq_files = [job.fileStore.readGlobalFile(input_fq_files[0], os.path.join(work_dir, original_filename + ".fq"))]
-    # paired read
-    elif len(input_fq_files) == 2:
-        fq_files = [job.fileStore.readGlobalFile(input_fq_files[0], os.path.join(work_dir, original_filename + ".R1.fq")),
-                    job.fileStore.readGlobalFile(input_fq_files[1], os.path.join(work_dir, original_filename + ".R2.fq"))]
-    # sanity check
-    else:
-        raise UserError("Got {} fq file ids before alignment, expected 1 or 2".format(len(input_fq_files)))
-
-    #TODO remove:
-    subprocess.check_call(['ls', '-laR', work_dir])
+    reference_location = os.path.join(work_dir, "reference")
+    mkdir_p(reference_location)
+    reference_name = download_reference(job, reference_location, config.reference)
 
     # bwa
-    bwa_cmd = 'bwa mem -t 4 -K 100000000 -R {} -Y {} {} '.format(
-        read_group_header, os.path.join("/data", os.path.basename(reference_location)),
+    cores = config.alignment_cores if config.alignment_cores is not None else config.cores
+    bwa_cmd = 'bwa mem -t {} -K 100000000 -R {} -Y {} {} '.format(
+        cores, read_group_header, os.path.join("/data/reference", os.path.basename(reference_name)),
         os.path.join("/data", os.path.basename(fq_files[0])))
     if len(fq_files) > 1:
         bwa_cmd += os.path.join("/data", os.path.basename(fq_files[1]))
     # other commands
     samblaster_cmd = "samblaster --addMateTags"
     samtools_sam2bam_cmd = "samtools view -Sb -"
-    samtools_sort_cmd = "samtools sort -T {} -o {}".format(config.uuid + ".sorting", os.path.join("/data", output_file_name))
+    #todo set cores on sort cmd.  split cores?
+    samtools_sort_cmd = "samtools sort -T {} -o {}".format(config.uuid + ".sorting", os.path.join("/data", output_filename))
 
     # modification for the docker file I use
     bwa_cmd = "/opt/bwa.kit/"+bwa_cmd
@@ -326,33 +260,93 @@ def perform_alignment(job, config, original_filename, input_fq_files, read_group
     job.fileStore.logToMaster("Running {} with parameters: {}".format(DOCKER_BWAKIT, params))
     dockerCall(job, tool=DOCKER_BWAKIT, workDir=work_dir, parameters=params)
 
-
     # sanity check
-    output_bam_location = os.path.join(work_dir, output_file_name)
+    output_bam_location = os.path.join(work_dir, output_filename)
     if not os.path.isfile(output_bam_location):
         raise UserError('Aligned BAM file "{}" does not exist'.format(output_bam_location))
+
+    _fixPermissions(DOCKER_BWAKIT, work_dir) #todo this is a temporary fix
 
     # save to output directory (for development)
     if config.save_intermediate_files:
         job.fileStore.logToMaster('Moving {} to output dir: {}'.format(output_bam_location, config.output_dir))
         copy_files(file_paths=[output_bam_location], output_dir=config.output_dir)
 
-    #TODO
-    if True: return
-
     # it worked
-    aligned_sam_id = job.fileStore.writeGlobalFile(output_bam_location)
+    aligned_bam_id = job.fileStore.writeGlobalFile(output_bam_location)
+    job.fileStore.logToMaster("TIME:perform_alignment:{}".format(time.time() - start))
 
-    # add next job
-    return aligned_sam_id, input_fq_files
+    # return for next job
+    return aligned_bam_id
+
+
+def extract_fastq_files_from_bam(job, work_dir, bam_name, is_paired, get_readgroup_header=True):
+
+    # get readgroup header
+    readgroup_header = None
+    if get_readgroup_header:
+        headers_name = bam_name + ".headers.txt"
+        headers_location = os.path.join(work_dir, headers_name)
+        cmd = ["view", "-H", os.path.join("/data", bam_name)]
+        with open(headers_location, 'w') as file:
+            dockerCall(job, tool=DOCKER_SAMTOOLS, workDir=work_dir, parameters=cmd, outfile=file)
+
+        # read file
+        if not os.path.isfile(headers_location):
+            raise UserError("Found no headers for {}".format(bam_name))
+        with open(headers_location, 'r') as f:
+            for l in f:
+                if l.startswith("@RG"):
+                    # check for multiple @RG headers
+                    if readgroup_header is not None and l != readgroup_header:
+                        job.fileStore.logToMaster("Found extra @RG header for file \"{}\": \"{}\""
+                                        .format(bam_name, "\\t".join(l.rstrip().split("\t"))), level=logging.WARN)
+                    else:
+                        readgroup_header = l.rstrip()
+                        # fix readgroup #todo maybe move this to alignment?
+                        readgroup_header = "\\t".join(readgroup_header.split("\t"))
+                        job.fileStore.logToMaster("Found @RG header for file \"{}\": \"{}\""
+                                                  .format(bam_name, readgroup_header))
+        if readgroup_header is None:
+            raise UserError("Found no @RG header for file \"{}\"".format(bam_name))
+
+
+    # prep for extraction into FQ
+    fastq_files=[]
+    bam_base = os.path.splitext(bam_name)[0]
+    docker_params = ["fastq"]
+    if is_paired:
+        fastq_files.append("{}_1.fq".format(bam_base))
+        fastq_files.append("{}_2.fq".format(bam_base))
+        fastq_files.append("{}_unpaired.bam".format(bam_base))
+        docker_params.extend(["-1", "{}".format(fastq_files[0]),
+                              "-2", os.path.join("/data", fastq_files[1]),
+                              "-0", os.path.join("/data", fastq_files[2])])
+    else:
+        fastq_files.append("{}.fq".format(bam_base))
+        docker_params.extend(["-1", os.path.join("/data", fastq_files[0])])
+    docker_params.extend([os.path.join("/data", bam_name)])
+    # extract
+    job.fileStore.logToMaster("Running {} with parameters: {}".format(DOCKER_SAMTOOLS, docker_params))
+    dockerCall(job, tool=DOCKER_SAMTOOLS,
+               workDir=work_dir, parameters=docker_params)
+    _fixPermissions(DOCKER_SAMTOOLS, work_dir)  # todo tmpfix
+
+    # validate the unpaired reads
+    if is_paired:
+        unpaired_size = os.stat(os.path.join(work_dir, fastq_files[2])).st_size
+        if unpaired_size != 0:
+            #maybe this should raise an exception
+            job.fileStore.logToMaster("Got non-zero length ({}) for unmatched reads in file \"{}\""
+                                      .format(unpaired_size, bam_name))
+
+    # return fastqs
+    return fastq_files, readgroup_header
 
 
 def merge_sam_files(job, config, aligned_bam_ids, removable_file_ids=None):
-    """
-    input: bam ids to mere
-    merge
-    output: bam
-    """
+    start = time.time()
+
     # cleanup of unnecessary files from previous steps
     remove_intermediate_jobstore_files(job, removable_file_ids)
 
@@ -380,6 +374,7 @@ def merge_sam_files(job, config, aligned_bam_ids, removable_file_ids=None):
     job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_SAMTOOLS, params))
     dockerCall(job, tool=DOCKER_SAMTOOLS,
                workDir=work_dir, parameters=params)
+    _fixPermissions(DOCKER_SAMTOOLS, work_dir)  # todo tmpfix
 
     # sanity check
     output_file_location = os.path.join(work_dir, output_file_name)
@@ -395,18 +390,17 @@ def merge_sam_files(job, config, aligned_bam_ids, removable_file_ids=None):
     output_id = job.fileStore.writeGlobalFile(output_file_location)
 
     # add next job
-    job.addFollowOnJobFn(mark_duplicates, config, output_id, aligned_bam_ids)
+    job.addFollowOnJobFn(mark_duplicates, config, output_id, aligned_bam_ids,
+                         memory=config.memory, cores=config.cores, disk=config.base_sample_size * PICARD_FS_TO_TO_DSK_REQ)
+    job.fileStore.logToMaster("TIME:merge_sam_files:{}".format(time.time() - start))
 
 
 def _get_default_docker_params(work_dir):
     return ['--rm','--log-driver','none', '-v' '{}:/data'.format(work_dir)]
 
 def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
-    """
-    input: bam
-    run picard for duplicate marking
-    output: bam
-    """
+    start = time.time()
+
     # cleanup of unnecessary files from previous steps
     remove_intermediate_jobstore_files(job, removable_file_ids)
 
@@ -459,13 +453,14 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
         copy_files(file_paths=outfiles, output_dir=config.output_dir)
 
     # add next job
-    job.addFollowOnJobFn(recalibrate_quality_scores, config, deduped_bam_id, [aligned_bam_id])
+    job.addFollowOnJobFn(recalibrate_quality_scores, config, deduped_bam_id, [aligned_bam_id],
+                         memory=config.memory, cores=config.cores, disk=config.base_sample_size * GATK_FS_TO_TO_DSK_REQ)
+    job.fileStore.logToMaster("TIME:mark_duplicates:{}".format(time.time() - start))
 
 
 def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=None):
-    """
+    start = time.time()
 
-    """
     # cleanup of unnecessary files from previous steps
     remove_intermediate_jobstore_files(job, removable_file_ids)
 
@@ -478,16 +473,16 @@ def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=Non
     work_dir = job.fileStore.getLocalTempDir()
     job.fileStore.readGlobalFile(input_bam_id, os.path.join(work_dir, recalibration_bam_name))
 
-    # get reference variants
+    # get reference
     reference_dir = os.path.join(work_dir, "reference")
-    os.mkdir(reference_dir)
-    variants = []
-    #todo specify this in the config
-    for variant in ["Homo_sapiens_assembly38.dbsnp138.vcf", "Mills_and_1000G_gold_standard.indels.hg38.vcf.gz",
-                      "Homo_sapiens_assembly38.known_indels.vcf.gz"]:
-        variants.append(download_variant(reference_dir, variant))
-    # get the reference
-    reference_location = download_reference(reference_dir, "GRCh38_full_analysis_set_plus_decoy_hla.fa")
+    mkdir_p(reference_dir)
+    reference_location = download_reference(job, reference_dir, config.reference)
+
+    # get variants
+    variant_dir = os.path.join(work_dir, "variants")
+    mkdir_p(variant_dir)
+    variants = download_variant(job, variant_dir, config.variants)
+
     # get bam index
     bai_location = index_bam(job, work_dir, recalibration_bam_name)
 
@@ -497,7 +492,7 @@ def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=Non
               "-I", os.path.join("/data", recalibration_bam_name),
               "-o", os.path.join("/data", recalibration_report_name)]
     for variant in variants:
-        params.extend(["-knownSites", os.path.join("/data/reference", os.path.basename(variant))])
+        params.extend(["-knownSites", os.path.join("/data/variants", variant)])
     optional_params = ["--downsample_to_fraction", ".1", "-L", "chr1", "-L", "chr2", "-L", "chr3", "-L", "chr4",
                        "-L", "chr5", "-L", "chr6", "-L", "chr7", "-L", "chr8", "-L", "chr9", "-L", "chr10",
                        "-L", "chr11", "-L", "chr12", "-L", "chr13", "-L", "chr14", "-L", "chr15",
@@ -532,14 +527,15 @@ def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=Non
         copy_files(file_paths=[recalibration_report_location], output_dir=config.output_dir)
 
     # add next job
-    job.addFollowOnJobFn(bin_quality_scores, config, input_bam_id, bam_index_id, recalibration_report_id)
+    job.addFollowOnJobFn(bin_quality_scores, config, input_bam_id, bam_index_id, recalibration_report_id,
+                         memory=config.memory, cores=config.cores, disk=config.base_sample_size * GATK_FS_TO_TO_DSK_REQ)
+    job.fileStore.logToMaster("TIME:recalibrate_quality_scores:{}".format(time.time() - start))
 
 #todo: merge these
 
 def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, removable_file_ids=None):
-    """
+    start = time.time()
 
-    """
     # cleanup of unnecessary files from previous steps
     remove_intermediate_jobstore_files(job, removable_file_ids)
 
@@ -562,11 +558,11 @@ def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, 
     # get reference
     reference_dir = os.path.join(work_dir, "reference")
     mkdir_p(reference_dir)
-    reference_location = download_reference(reference_dir, "GRCh38_full_analysis_set_plus_decoy_hla.fa")
+    reference_name = download_reference(job, reference_dir, config.reference)
 
     #prep commands
     params = ["-T", "PrintReads",
-              "-R", os.path.join("/data/reference", os.path.basename(reference_location)),
+              "-R", os.path.join("/data/reference", os.path.basename(reference_name)),
               "-I", os.path.join("/data", input_bam_name),
               "-o", os.path.join("/data", output_bam_name),
               "-BQSR", os.path.join("/data", bqsr_report_name),
@@ -598,15 +594,15 @@ def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, 
         copy_files(file_paths=[output_bam_location], output_dir=config.output_dir)
 
     # add next job
-    job.addFollowOnJobFn(validate_output, config, output_bam_id, [input_bam_id, bam_index_id, bsqr_report_id])
-    pass
+    job.addFollowOnJobFn(validate_output, config, output_bam_id, [input_bam_id, bam_index_id, bsqr_report_id],
+                         memory=config.memory, cores=config.cores, disk=config.base_sample_size * CRAM_FS_TO_TO_DSK_REQ)
+    job.fileStore.logToMaster("TIME:bin_quality_scores:{}".format(time.time() - start))
 
 
 # def convert_to_cram_and_validate(job, config, input_bam_id, removable_file_ids=None):
 def validate_output(job, config, input_bam_id, removable_file_ids=None):
-    """
+    start = time.time()
 
-    """
     # cleanup of unnecessary files from previous steps
     remove_intermediate_jobstore_files(job, removable_file_ids)
 
@@ -621,10 +617,9 @@ def validate_output(job, config, input_bam_id, removable_file_ids=None):
     job.fileStore.readGlobalFile(input_bam_id, os.path.join(work_dir, input_bam_name))
 
     # get reference
-    reference_name = "GRCh38_full_analysis_set_plus_decoy_hla.fa"
     reference_dir = os.path.join(work_dir, "reference")
     mkdir_p(reference_dir)
-    reference_location = download_reference(reference_dir, reference_name) #todo
+    reference_name = download_reference(job, reference_dir, config.reference) #todo
 
     # convert to cram
     params = ['view', '-C',
@@ -633,6 +628,7 @@ def validate_output(job, config, input_bam_id, removable_file_ids=None):
               os.path.join("/data", input_bam_name)]
     job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_SAMTOOLS, params))
     dockerCall(job, tool=DOCKER_SAMTOOLS, workDir=work_dir, parameters=params)
+    _fixPermissions(DOCKER_SAMTOOLS, work_dir) #todo this is a temporary fix
 
     # sanity check
     output_cram_location = os.path.join(work_dir, output_cram_name)
@@ -647,6 +643,7 @@ def validate_output(job, config, input_bam_id, removable_file_ids=None):
     output_files = [output_cram_location, output_bam_location]
     job.fileStore.logToMaster('Moving {} to output dir: {}'.format(output_bam_location, config.output_dir))
     copy_files(file_paths=output_files, output_dir=config.output_dir)
+    job.fileStore.logToMaster("TIME:validate_output:{}".format(time.time() - start))
 
 
 def remove_intermediate_jobstore_files(job, file_id_list):
@@ -677,29 +674,76 @@ def index_bam(job, work_dir, bam_name):
     return bai_location
 
 
-def download_reference(work_dir, reference_location):
-    # reference_tar_name = os.path.basename(reference_location)
-    # reference_location = os.path.join(work_dir, reference_tar_name)
-    # todo download reference
-    destination = os.path.join(work_dir, reference_location)
-    if trevdev:
-        for file in glob.glob(os.path.join("/mnt/trevor/reference", reference_location[0:-2]) + "*"):
+def download_reference(job, work_dir, reference_location):
+
+    # destination = os.path.join(work_dir, reference_location)
+    # if trevdev:
+    #     for file in glob.glob(os.path.join("/mnt/trevor/reference", reference_location[0:-2]) + "*"):
+    #         dest = os.path.join(work_dir, os.path.basename(file))
+    #         shutil.copyfile(file, dest)
+    #     return destination
+
+    # get files and names
+    download_url(job, url=reference_location, work_dir=work_dir)
+    reference_tar_name = os.path.basename(reference_location)
+    reference_tarfile_location = os.path.join(work_dir, reference_tar_name)
+
+    # untar
+    subprocess.check_call(['tar', '-xvf', reference_tarfile_location, '-C', work_dir])
+    os.remove(reference_tarfile_location)
+
+    # potentially move out of inner directory
+    reference_base_name = reference_tar_name.split(".")[0]
+    if os.path.isdir(os.path.join(work_dir, reference_base_name)):
+        for file in glob.glob(os.path.join(work_dir, reference_base_name, "*")):
             dest = os.path.join(work_dir, os.path.basename(file))
-            shutil.copyfile(file, dest)
-        return destination
-    raise UserError("download_reference not implemented")
+            shutil.move(file, dest)
+        os.rmdir(os.path.join(work_dir, reference_base_name))
+
+    # get fq file of reference (and sanity check)
+    reference_fa_name = reference_base_name + ".fa"
+    if not os.path.isfile(os.path.join(work_dir, reference_fa_name)):
+        raise UserError("Reference tar '{}' not in expected format: {} => [{}/]{}"
+                        .format(reference_location, reference_tar_name, reference_base_name, reference_fa_name))
+
+    return reference_fa_name
 
 
-def download_variant(work_dir, variant_location):
-    # todo download reference
-    destination = os.path.join(work_dir, variant_location)
-    if trevdev:
-        for file in glob.glob(os.path.join("/mnt/trevor/reference", variant_location) + "*"):
+def download_variant(job, work_dir, variant_location):
+
+    # we need this for file detection
+    if len(glob.glob(os.path.join(work_dir, "*"))) != 0:
+        raise UserError("download_variant must have an empty work dir")
+
+    # get the variant tarball
+    download_url(job, url=variant_location, work_dir=work_dir)
+    variant_tar_name = os.path.basename(variant_location)
+    variant_tarfile_location = os.path.join(work_dir, variant_tar_name)
+
+    # untar
+    subprocess.check_call(['tar', '-xvf', variant_tarfile_location, '-C', work_dir])
+    os.remove(variant_tarfile_location)
+
+    # potentially move out of inner directory
+    variant_base_name = variant_tar_name.split(".")[0]
+    if os.path.isdir(os.path.join(work_dir, variant_base_name)):
+        for file in glob.glob(os.path.join(work_dir, variant_base_name, "*")):
             dest = os.path.join(work_dir, os.path.basename(file))
-            shutil.copyfile(file, dest)
-        return destination
+            shutil.move(file, dest)
+        os.rmdir(os.path.join(work_dir, variant_base_name))
 
-    raise UserError("download_variants not implemented")
+    # variants to return are prefix of another file
+    variant_names = glob.glob(os.path.join(work_dir, "*"))
+    variant_bases = set()
+    for variant_name in variant_names:
+        for vn in variant_names:
+            if vn != variant_name and vn.startswith(variant_name):
+                variant_bases.add(os.path.basename(variant_name))
+    if len(variant_bases) == 0:
+        raise UserError("Variant tar '{}' not in expected format: {} => [{}/](example.vcf[.gz], example.vcf[.gz].[tbi|idx])+"
+                        .format(variant_location, variant_base_name))
+
+    return variant_bases
 
 
 def generate_config():
@@ -716,14 +760,23 @@ def generate_config():
         # Comments (beginning with #) do not need to be removed. Optional parameters left blank are treated as false.
         ##############################################################################################################
         # Required: URL {scheme} to reference genome tarball.  Defaults to the GRCh38DH, 1000 Genomes Project version
-        reference-genome: s3://cgl-pipeline-inputs/topmed_cgl/todo/host/that/tarball
+        reference: s3://cgl-pipeline-inputs/topmed/GRCh38_full_analysis_set_plus_decoy_hla.tar.gz
 
         # Required: URL {scheme} to variant files tarball.  All .vcf or .vcf.gz files will be used during base recalibration
-        varient-files: s3://cgl-pipeline-inputs/topmed_cgl/todo/host/that/tarball
+        variants: s3://cgl-pipeline-inputs/topmed/GATK_hg38_variants.tar.gz
 
         # Required: Output location of sample. Can be full path to a directory or an s3:// URL
         # Warning: S3 buckets must exist prior to upload or it will fail.
         output-dir:
+
+        # Optional: Input file size in bytes (for resource estimation)
+        input-file-size:
+
+        ### Alignment Resource Management
+        # Optional: CPU cores to use during alignment. default: no special alignment configuration. ex: 8
+        alignment-cores:
+        # Optional: Memory string to use during alignment. default: no special alignment configuration. ex: 8G
+        alignment-memory:
 
         # Optional: Save intermediate files to the output directory (for debugging)
         save-intermediate-files: False
@@ -854,20 +907,22 @@ def main():
         parsed_config = {x.replace('-', '_'): y for x, y in yaml.load(open(args.config).read()).iteritems()}
         config = argparse.Namespace(**parsed_config)
         config.maxCores = int(args.maxCores) if args.maxCores else sys.maxint
+        config.maxMemory = int(args.maxMemory) if args.maxMemory else sys.maxint
+        config.maxDisk = int(args.maxDisk) if args.maxDisk else sys.maxint
 
         # Config sanity checks
-        require(config.output_dir, 'No output location specified: {}'.format(config.output_dir))
+        require(config.output_dir, 'No output location specified')
         if urlparse(config.output_dir).scheme != "s3":
             mkdir_p(config.output_dir)
+        require(config.reference, 'No reference tarball specified')
+        require(config.variants, 'No variants tarball specified')
         if config.save_intermediate_files is None or not isinstance(config.save_intermediate_files, bool):
             config.save_intermediate_files = False
-        #todo more sanity checks
-        # require(config.kallisto_index,
-        #         'URLs not provided for Kallisto index, so there is nothing to do!')
-        # require(urlparse(config.kallisto_index).scheme in SCHEMES,
-        #         'Kallisto index in config must have the appropriate URL prefix: {}'.format(SCHEMES))
         if not config.output_dir.endswith('/'):
             config.output_dir += '/'
+        #missing alignment_cores indicates no special alignment configuration
+        # if config.alignment_cores is None:
+        #     config.alignment_cores = ALIGNMENT_CORES_DEFAULT
 
         # Program checks
         for program in ['curl', 'docker']:
