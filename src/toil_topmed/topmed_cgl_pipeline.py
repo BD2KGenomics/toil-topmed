@@ -51,14 +51,13 @@ DEFAULT_MANIFEST_NAME = 'manifest-toil-topmed.tsv'
 # docker images
 #todo unlatest this
 DOCKER_SAMTOOLS = "quay.io/ucsc_cgl/samtools:1.3--256539928ea162949d8a65ca5c79a72ef557ce7c"
-DOCKER_BWAKIT = "quay.io/ucsc_cgl/bwakit:latest"
+DOCKER_BWAKIT = "quay.io/ucsc_cgl/bwakit:0.7.15--ed1aeaaebf4d88ba51042da83f02ef8373a822b9"
 DOCKER_GATK = "quay.io/ucsc_cgl/gatk:3.7--e931e1ca12f6d930b755e5ac9c0c4ca266370b7b"
 DOCKER_PICARD = "quay.io/ucsc_cgl/picardtools:2.9.0--4d726c4a1386d4252a0fc72d49b1d3f5b50b1e23"
 
-# todo temporary for development
-trevdev = True
 
-# Pipeline specific functions
+
+
 def parse_samples(path_to_manifest):
     """
     Parses samples, specified in either a manifest or listed with --samples
@@ -96,6 +95,7 @@ def parse_samples(path_to_manifest):
                 elif type == 'fq':
                     valid_types = FQ_FORMATS
                 else:
+                    # valid_types = TAR_FORMATS
                     raise UserError("Files in local folder must be of type: ['bam', 'fq']")
                 url = ['file://' + os.path.join(given_url, x) for x in filter(lambda x: x.endswith(valid_types), os.listdir(given_url))]
                 require(len(url) > 0, "Found no files in local folder: '{}'".format(given_url))
@@ -164,23 +164,24 @@ def prepare_input(job, sample, config):
     config.uuid = uuid
     config.file_type = file_type
     config.is_paired = paired
+    work_dir = job.fileStore.getLocalTempDir()
 
     # global resource estimation
     estimated_input_size = config.input_file_size
     if estimated_input_size is None:
         raise UserError("For now, configuration parameter input-file-size is required")
     config.cores = min(config.maxCores, multiprocessing.cpu_count())
-    config.memory = min(config.maxMemory, os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')) #todo this in a better way
+    config.memory = min(config.maxMemory, (os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') - 2000000000)) #todo this in a better way
     config.base_sample_size = estimated_input_size * len(urls)
-    #todo specify
+    #todo remove this, should be specified
     config.disk = min(config.maxDisk, config.base_sample_size * ALIGN_FS_TO_DSK_REQ)
 
-    # alignment resource estimation
 
     # need to hand each url off to appropriate processing
     bam_ids = []
-    fastq_ids = [] #this is to track jobstore files which can be removed
+    temporary_file_ids = [] #this is to track jobstore files which can be removed
     for url in urls:
+        # alignment resource estimation
         aln_disk = estimated_input_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE
         aln_mem = config.alignment_memory if config.alignment_memory is not None else config.memory
         aln_cpu = config.alignment_cores if config.alignment_cores is not None else config.cores
@@ -188,15 +189,52 @@ def prepare_input(job, sample, config):
         #need to extract to fq
         if file_type == 'bam':
             job.fileStore.logToMaster("Spawning job to handle {}".format(url))
-            child_job = job.addChildJobFn(perform_alignment, config, url, memory=aln_mem, cores=aln_cpu, disk=aln_disk)
-            bam_ids.append(child_job.rv())
+            child_job = job.addChildJobFn(perform_alignment, config, "bam", sample_url=url, memory=aln_mem, cores=aln_cpu, disk=aln_disk)
+            bam_ids.append(child_job.rv(0))
+            temporary_file_ids.append(child_job.rv(1))
         elif file_type == 'tar':
-            # tar_path = os.path.join(work_dir, os.path.basename(url))
-            # download_url(job, url=url, work_dir=work_dir)
-            # subprocess.check_call(['tar', '-xvf', tar_path, '-C', fastq_location])
-            # os.remove(tar_path)
-            #todo: how to specify read group?
-            raise UserError("ZIP not implemented")
+            tar_name =  os.path.basename(url)
+            tar_base = tar_name.split(".")[0]
+            tar_work_dir = os.path.join(work_dir, tar_base)
+            mkdir_p(tar_work_dir)
+            download_url(job, url=url, work_dir=tar_work_dir)
+            tar_file_location = os.path.join(tar_work_dir, tar_name)
+            # subprocess.check_call(['tar', '-xvf', tar_file_location])
+            subprocess.check_call(['tar', '-xvf', tar_file_location, '-C', tar_work_dir])
+
+            #cleanup and post-process
+            os.remove(tar_file_location)
+            if os.path.isdir(os.path.join(tar_work_dir, tar_base)):
+                for file in glob.glob(os.path.join(tar_work_dir, tar_base, "*")):
+                    dest = os.path.join(tar_work_dir, os.path.basename(file))
+                    shutil.move(file, dest)
+                os.rmdir(os.path.join(tar_work_dir, tar_base))
+
+            # handle file by type
+            file_count = 0
+            for bam_file in glob.glob(os.path.join(tar_work_dir, "*.bam")):
+                bam_file_id = job.fileStore.writeGlobalFile(bam_file)
+                job.fileStore.logToMaster("Spawning job to handle bam '{}' in '{}'".format(os.path.basename(bam_file), url))
+                child_job = job.addChildJobFn(perform_alignment, config, "bam", sample_id=bam_file_id, memory=aln_mem,
+                                              cores=aln_cpu, disk=aln_disk)
+                bam_ids.append(child_job.rv(0))
+                temporary_file_ids.append(child_job.rv(1))
+                file_count += 1
+            for fq_glob in [os.path.join(tar_work_dir, ("*" + fq)) for fq in FQ_FORMATS]:
+                for fq in glob.glob(fq_glob):
+                    raise UserError("FASTQ files in 'tar' not supported: {}".format(fq))
+                    # fq_file_id = job.fileStore.writeGlobalFile(fq)
+                    # child_job = job.addChildJobFn(perform_alignment, config, "fq", sample_id=fq_file_id, memory=aln_mem,
+                    #                               cores=aln_cpu, disk=aln_disk)
+                    # bam_ids.append(child_job.rv(0))
+                    # temporary_file_ids.append(child_job.rv(1))
+
+            #sanity check
+            job.fileStore.logToMaster("Spawned {} jobs to handle {}".format(file_count, url))
+            if file_count == 0:
+                raise UserError("Got no files in tar: '{}'".format(url))
+
+
         # just need to download
         elif file_type == 'fq':
             # download_url(job, url=url, work_dir=fastq_location)
@@ -207,21 +245,35 @@ def prepare_input(job, sample, config):
             raise UserError('PROGRAMMER ERROR: URL "{}" with type "{}" did not match expected cases for preprocessing'
                             .format(url, file_type))
 
-    job.addFollowOnJobFn(merge_sam_files, config, bam_ids, fastq_ids,
+    job.addFollowOnJobFn(merge_sam_files, config, bam_ids, temporary_file_ids,
                          memory=config.memory, cores=config.cores, disk=(config.base_sample_size * MERGE_FS_TO_TO_DSK_REQ))
 
 
-def perform_alignment(job, config, sample_url):
+def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
+
+    # validate input
+    if sample_url is None and sample_id is None:
+        raise UserError("perform_alignment invoked with neither sample_url nor sample_id")
+    if sample_url is not None and sample_id is not None:
+        raise UserError("perform_alignment invoked with both sample_url and sample_id")
+    if input_type != "bam":
+        raise UserError("ingput format '{}' not supported for perform_alignment".format(input_type))
 
     # prep
     start = time.time()
     work_dir = job.fileStore.getLocalTempDir()
     is_paired = config.is_paired
+    is_global_file = sample_id is not None
 
     # download bam
-    download_url(job, url=sample_url, work_dir=work_dir)
-    filename = os.path.basename(sample_url)
-    output_filename=config.uuid+"."+filename
+    filename = "{}.in.bam".format(config.uuid)
+    output_filename="{}.out.bam".format(config.uuid)
+    if is_global_file:
+        job.fileStore.readGlobalFile(sample_id, os.path.join(work_dir, filename))
+    else:
+        download_url(job, url=sample_url, work_dir=work_dir)
+        filename = os.path.basename(sample_url)
+        output_filename=config.uuid+"."+filename
     if not os.path.isfile(os.path.join(work_dir, filename)):
         raise UserError("Failed to download {}".format(sample_url))
 
@@ -594,13 +646,12 @@ def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, 
         copy_files(file_paths=[output_bam_location], output_dir=config.output_dir)
 
     # add next job
-    job.addFollowOnJobFn(validate_output, config, output_bam_id, [input_bam_id, bam_index_id, bsqr_report_id],
+    job.addFollowOnJobFn(convert_to_cram_and_validate, config, output_bam_id, [input_bam_id, bam_index_id, bsqr_report_id],
                          memory=config.memory, cores=config.cores, disk=config.base_sample_size * CRAM_FS_TO_TO_DSK_REQ)
     job.fileStore.logToMaster("TIME:bin_quality_scores:{}".format(time.time() - start))
 
 
-# def convert_to_cram_and_validate(job, config, input_bam_id, removable_file_ids=None):
-def validate_output(job, config, input_bam_id, removable_file_ids=None):
+def convert_to_cram_and_validate(job, config, input_bam_id, removable_file_ids=None):
     start = time.time()
 
     # cleanup of unnecessary files from previous steps
@@ -619,7 +670,7 @@ def validate_output(job, config, input_bam_id, removable_file_ids=None):
     # get reference
     reference_dir = os.path.join(work_dir, "reference")
     mkdir_p(reference_dir)
-    reference_name = download_reference(job, reference_dir, config.reference) #todo
+    reference_name = download_reference(job, reference_dir, config.reference)
 
     # convert to cram
     params = ['view', '-C',
@@ -628,7 +679,6 @@ def validate_output(job, config, input_bam_id, removable_file_ids=None):
               os.path.join("/data", input_bam_name)]
     job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_SAMTOOLS, params))
     dockerCall(job, tool=DOCKER_SAMTOOLS, workDir=work_dir, parameters=params)
-    _fixPermissions(DOCKER_SAMTOOLS, work_dir) #todo this is a temporary fix
 
     # sanity check
     output_cram_location = os.path.join(work_dir, output_cram_name)
@@ -662,6 +712,7 @@ def remove_intermediate_jobstore_files(job, file_id_list):
 
 
 def index_bam(job, work_dir, bam_name):
+    start = time.time()
     bam_location = os.path.join(work_dir, bam_name)
     bai_location = "{}.bai".format(bam_location)
     job.fileStore.logToMaster("Indexing {}".format(bam_location))
@@ -671,17 +722,13 @@ def index_bam(job, work_dir, bam_name):
         raise UserError("File not found after indexing BAM: {}".format(bai_location))
     else:
         job.fileStore.logToMaster("Index created: {}".format(bai_location))
+    job.fileStore.logToMaster("TIME:index_bam:{}".format(time.time() - start))
     return bai_location
 
 
 def download_reference(job, work_dir, reference_location):
 
-    # destination = os.path.join(work_dir, reference_location)
-    # if trevdev:
-    #     for file in glob.glob(os.path.join("/mnt/trevor/reference", reference_location[0:-2]) + "*"):
-    #         dest = os.path.join(work_dir, os.path.basename(file))
-    #         shutil.copyfile(file, dest)
-    #     return destination
+    start = time.time()
 
     # get files and names
     download_url(job, url=reference_location, work_dir=work_dir)
@@ -706,10 +753,12 @@ def download_reference(job, work_dir, reference_location):
         raise UserError("Reference tar '{}' not in expected format: {} => [{}/]{}"
                         .format(reference_location, reference_tar_name, reference_base_name, reference_fa_name))
 
+    job.fileStore.logToMaster("TIME:download_reference:{}".format(time.time() - start))
     return reference_fa_name
 
 
 def download_variant(job, work_dir, variant_location):
+    start = time.time()
 
     # we need this for file detection
     if len(glob.glob(os.path.join(work_dir, "*"))) != 0:
@@ -743,6 +792,7 @@ def download_variant(job, work_dir, variant_location):
         raise UserError("Variant tar '{}' not in expected format: {} => [{}/](example.vcf[.gz], example.vcf[.gz].[tbi|idx])+"
                         .format(variant_location, variant_base_name))
 
+    job.fileStore.logToMaster("TIME:download_variant:{}".format(time.time() - start))
     return variant_bases
 
 

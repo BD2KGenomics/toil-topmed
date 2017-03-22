@@ -93,3 +93,6 @@ bin/
 # pycharm
 .idea
 
+#topmed
+*.yaml
+*.tsv
