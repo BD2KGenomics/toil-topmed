@@ -43,6 +43,7 @@ PICARD_FS_TO_TO_DSK_REQ = 1
 GATK_FS_TO_TO_DSK_REQ = 1
 CRAM_FS_TO_TO_DSK_REQ = 1
 REFERENCE_SIZE = 8 * 1024 * 1024 * 1024 #8G
+MAX_MEMORY = 32 * 1024 * 1024 * 1024 #32GB
 
 # filenames
 DEFAULT_CONFIG_NAME = 'config-toil-topmed.yaml'
@@ -167,12 +168,10 @@ def prepare_input(job, sample, config):
     work_dir = job.fileStore.getLocalTempDir()
 
     # global resource estimation
-    estimated_input_size = config.input_file_size
-    if estimated_input_size is None:
+    if config.input_file_size is None:
         raise UserError("For now, configuration parameter input-file-size is required")
     config.cores = min(config.maxCores, multiprocessing.cpu_count())
-    config.memory = min(config.maxMemory, (os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') - 2000000000)) #todo this in a better way
-    config.base_sample_size = estimated_input_size * len(urls)
+    config.base_sample_size = config.input_file_size * len(urls)
     #todo remove this, should be specified
     config.disk = min(config.maxDisk, config.base_sample_size * ALIGN_FS_TO_DSK_REQ)
 
@@ -182,24 +181,25 @@ def prepare_input(job, sample, config):
     temporary_file_ids = [] #this is to track jobstore files which can be removed
     for url in urls:
         # alignment resource estimation
-        aln_disk = estimated_input_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE
-        aln_mem = config.alignment_memory if config.alignment_memory is not None else config.memory
+        aln_disk = config.input_file_size * ALIGN_FS_TO_DSK_REQ #+ REFERENCE_SIZE
+        aln_mem = str(config.alignment_memory if config.alignment_memory is not None else config.memory)
         aln_cpu = config.alignment_cores if config.alignment_cores is not None else config.cores
 
-        #need to extract to fq
         if file_type == 'bam':
             job.fileStore.logToMaster("Spawning job to handle {}".format(url))
             child_job = job.addChildJobFn(perform_alignment, config, "bam", sample_url=url, memory=aln_mem, cores=aln_cpu, disk=aln_disk)
             bam_ids.append(child_job.rv(0))
             temporary_file_ids.append(child_job.rv(1))
         elif file_type == 'tar':
+            # name prep
             tar_name =  os.path.basename(url)
             tar_base = tar_name.split(".")[0]
             tar_work_dir = os.path.join(work_dir, tar_base)
             mkdir_p(tar_work_dir)
+
+            # get and untar
             download_url(job, url=url, work_dir=tar_work_dir)
             tar_file_location = os.path.join(tar_work_dir, tar_name)
-            # subprocess.check_call(['tar', '-xvf', tar_file_location])
             subprocess.check_call(['tar', '-xvf', tar_file_location, '-C', tar_work_dir])
 
             #cleanup and post-process
@@ -957,8 +957,9 @@ def main():
         parsed_config = {x.replace('-', '_'): y for x, y in yaml.load(open(args.config).read()).iteritems()}
         config = argparse.Namespace(**parsed_config)
         config.maxCores = int(args.maxCores) if args.maxCores else sys.maxint
-        config.maxMemory = int(args.maxMemory) if args.maxMemory else sys.maxint
         config.maxDisk = int(args.maxDisk) if args.maxDisk else sys.maxint
+        config.maxMemory = args.maxMemory if args.maxMemory else str(sys.maxint)
+        config.memory = args.maxMemory if args.maxMemory else str(MAX_MEMORY)
 
         # Config sanity checks
         require(config.output_dir, 'No output location specified')
