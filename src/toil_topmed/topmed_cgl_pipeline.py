@@ -299,7 +299,8 @@ def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
     samblaster_cmd = "samblaster --addMateTags"
     samtools_sam2bam_cmd = "samtools view -Sb -"
     #todo set cores on sort cmd.  split cores?
-    samtools_sort_cmd = "samtools sort -T {} -o {}".format(config.uuid + ".sorting", os.path.join("/data", output_filename))
+    samtools_sort_cmd = "samtools sort -@ {} -T {} -o {}".format(cores, config.uuid + ".sorting",
+                                                                 os.path.join("/data", output_filename))
 
     # modification for the docker file I use
     bwa_cmd = "/opt/bwa.kit/"+bwa_cmd
@@ -476,6 +477,7 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
               "M={}".format(os.path.join("/data", metrics_filename)),
               "ASSUME_SORT_ORDER=coordinate"]
     job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_PICARD, params))
+
     docker_params = _get_default_docker_params(work_dir)
     docker_params.extend(['-e' 'JAVA_OPTS=-Djava.io.tmpdir=/data/.java_tmp'])
     dockerCall(job, tool=DOCKER_PICARD, workDir=work_dir, parameters=params, dockerParameters=docker_params)
