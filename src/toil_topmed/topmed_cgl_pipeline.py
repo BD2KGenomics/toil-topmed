@@ -331,8 +331,8 @@ def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
     aligned_bam_id = job.fileStore.writeGlobalFile(output_bam_location)
     job.fileStore.logToMaster("TIME:{}:perform_alignment:{}".format(config.uuid, time.time() - start))
 
-    # return for next job
-    return aligned_bam_id
+    # return for next job (return sample id even if null)
+    return aligned_bam_id, sample_id
 
 
 def extract_fastq_files_from_bam(job, work_dir, bam_name, is_paired, get_readgroup_header=True):
@@ -705,13 +705,17 @@ def remove_intermediate_jobstore_files(job, file_id_list):
     # for cases where there is nothing to remove: let this function handle it
     if file_id_list is None or len(file_id_list) == 0: return
     # one case has file_id_list as list of list of files
-    if isinstance(file_id_list[0], list):
-        tmp = []
-        [tmp.extend(f) for f in file_id_list]
-        file_id_list = tmp
-    # remove global files
+    removed_files_count = 0
     for file_id in file_id_list:
-        job.fileStore.deleteGlobalFile(file_id)
+        if file_id is None:
+            continue
+        elif isinstance(file_id, list):
+            for fid in file_id:
+                job.fileStore.deleteGlobalFile(fid)
+                removed_files_count += 1
+        else:
+            job.fileStore.deleteGlobalFile(file_id)
+            removed_files_count += 1
     # log it
     job.fileStore.logToMaster("Removed {} intermediate files".format(len(file_id_list)))
 
