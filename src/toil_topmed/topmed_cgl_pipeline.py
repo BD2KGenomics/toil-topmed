@@ -13,6 +13,7 @@ import math
 import shutil
 import glob
 import time
+import datetime
 import logging
 
 import yaml
@@ -257,9 +258,10 @@ def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
     if sample_url is not None and sample_id is not None:
         raise UserError("perform_alignment invoked with both sample_url and sample_id")
     if input_type != "bam":
-        raise UserError("ingput format '{}' not supported for perform_alignment".format(input_type))
+        raise UserError("input format '{}' not supported for perform_alignment".format(input_type))
 
     # prep
+    job.fileStore.logToMaster("START_TIME:{}:{}".format(config.uuid, datetime.datetime.now()))
     start = time.time()
     work_dir = job.fileStore.getLocalTempDir()
     is_paired = config.is_paired
@@ -327,7 +329,7 @@ def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
 
     # it worked
     aligned_bam_id = job.fileStore.writeGlobalFile(output_bam_location)
-    job.fileStore.logToMaster("TIME:perform_alignment:{}".format(time.time() - start))
+    job.fileStore.logToMaster("TIME:{}:perform_alignment:{}".format(config.uuid, time.time() - start))
 
     # return for next job
     return aligned_bam_id
@@ -445,7 +447,7 @@ def merge_sam_files(job, config, aligned_bam_ids, removable_file_ids=None):
     # add next job
     job.addFollowOnJobFn(mark_duplicates, config, output_id, aligned_bam_ids,
                          memory=config.memory, cores=config.cores, disk=config.base_sample_size * PICARD_FS_TO_TO_DSK_REQ)
-    job.fileStore.logToMaster("TIME:merge_sam_files:{}".format(time.time() - start))
+    job.fileStore.logToMaster("TIME:{}:merge_sam_files:{}".format(config.uuid, time.time() - start))
 
 
 def _get_default_docker_params(work_dir):
@@ -509,7 +511,7 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
     # add next job
     job.addFollowOnJobFn(recalibrate_quality_scores, config, deduped_bam_id, [aligned_bam_id],
                          memory=config.memory, cores=config.cores, disk=config.base_sample_size * GATK_FS_TO_TO_DSK_REQ)
-    job.fileStore.logToMaster("TIME:mark_duplicates:{}".format(time.time() - start))
+    job.fileStore.logToMaster("TIME:{}:mark_duplicates:{}".format(config.uuid, time.time() - start))
 
 
 def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=None):
@@ -583,7 +585,7 @@ def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=Non
     # add next job
     job.addFollowOnJobFn(bin_quality_scores, config, input_bam_id, bam_index_id, recalibration_report_id,
                          memory=config.memory, cores=config.cores, disk=config.base_sample_size * GATK_FS_TO_TO_DSK_REQ)
-    job.fileStore.logToMaster("TIME:recalibrate_quality_scores:{}".format(time.time() - start))
+    job.fileStore.logToMaster("TIME:{}:recalibrate_quality_scores:{}".format(config.uuid, time.time() - start))
 
 #todo: merge these
 
@@ -650,7 +652,7 @@ def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, 
     # add next job
     job.addFollowOnJobFn(convert_to_cram_and_validate, config, output_bam_id, [input_bam_id, bam_index_id, bsqr_report_id],
                          memory=config.memory, cores=config.cores, disk=config.base_sample_size * CRAM_FS_TO_TO_DSK_REQ)
-    job.fileStore.logToMaster("TIME:bin_quality_scores:{}".format(time.time() - start))
+    job.fileStore.logToMaster("TIME:{}:bin_quality_scores:{}".format(config.uuid, time.time() - start))
 
 
 def convert_to_cram_and_validate(job, config, input_bam_id, removable_file_ids=None):
@@ -695,7 +697,8 @@ def convert_to_cram_and_validate(job, config, input_bam_id, removable_file_ids=N
     output_files = [output_cram_location, output_bam_location]
     job.fileStore.logToMaster('Moving {} to output dir: {}'.format(output_bam_location, config.output_dir))
     copy_files(file_paths=output_files, output_dir=config.output_dir)
-    job.fileStore.logToMaster("TIME:validate_output:{}".format(time.time() - start))
+    job.fileStore.logToMaster("TIME:{}:validate_output:{}".format(config.uuid, time.time() - start))
+    job.fileStore.logToMaster("END_TIME:{}:{}".format(config.uuid, datetime.datetime.now()))
 
 
 def remove_intermediate_jobstore_files(job, file_id_list):
@@ -724,7 +727,7 @@ def index_bam(job, work_dir, bam_name):
         raise UserError("File not found after indexing BAM: {}".format(bai_location))
     else:
         job.fileStore.logToMaster("Index created: {}".format(bai_location))
-    job.fileStore.logToMaster("TIME:index_bam:{}".format(time.time() - start))
+    job.fileStore.logToMaster("TIME::index_bam:{}".format(time.time() - start))
     return bai_location
 
 
@@ -755,7 +758,7 @@ def download_reference(job, work_dir, reference_location):
         raise UserError("Reference tar '{}' not in expected format: {} => [{}/]{}"
                         .format(reference_location, reference_tar_name, reference_base_name, reference_fa_name))
 
-    job.fileStore.logToMaster("TIME:download_reference:{}".format(time.time() - start))
+    job.fileStore.logToMaster("TIME::download_reference:{}".format(time.time() - start))
     return reference_fa_name
 
 
@@ -794,7 +797,7 @@ def download_variant(job, work_dir, variant_location):
         raise UserError("Variant tar '{}' not in expected format: {} => [{}/](example.vcf[.gz], example.vcf[.gz].[tbi|idx])+"
                         .format(variant_location, variant_base_name))
 
-    job.fileStore.logToMaster("TIME:download_variant:{}".format(time.time() - start))
+    job.fileStore.logToMaster("TIME::download_variant:{}".format(time.time() - start))
     return variant_bases
 
 
