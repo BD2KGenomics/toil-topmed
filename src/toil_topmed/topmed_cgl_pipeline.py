@@ -452,7 +452,7 @@ def merge_sam_files(job, config, aligned_bam_ids, removable_file_ids=None):
 
 
 def _get_default_docker_params(work_dir):
-    return ['--rm','--log-driver','none', '-v' '{}:/data'.format(work_dir)]
+    return ['--rm','--log-driver','none', '-v', '{}:/data'.format(work_dir)]
 
 def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
     start = time.time()
@@ -482,7 +482,7 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
     job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_PICARD, params))
 
     docker_params = _get_default_docker_params(work_dir)
-    docker_params.extend(['-e' 'JAVA_OPTS=-Djava.io.tmpdir=/data/.java_tmp'])
+    docker_params.extend(['-e', 'JAVA_OPTS=-Djava.io.tmpdir=/data/.java_tmp'])
     dockerCall(job, tool=DOCKER_PICARD, workDir=work_dir, parameters=params, dockerParameters=docker_params)
 
     # verify output
