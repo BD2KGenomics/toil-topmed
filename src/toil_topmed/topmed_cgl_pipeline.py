@@ -38,11 +38,12 @@ PAIRED_FRONT_SUFFIXES = ("_1", "R1")
 PAIRED_BACK_SUFFIXES = ("_2", "R2")
 
 # resource estimatin
+PREPARE_FS_TO_TO_DSK_REQ = 2.5
 ALIGN_FS_TO_DSK_REQ = 6
-MERGE_FS_TO_TO_DSK_REQ = 1
-PICARD_FS_TO_TO_DSK_REQ = 1
-GATK_FS_TO_TO_DSK_REQ = 1
-CRAM_FS_TO_TO_DSK_REQ = 1
+MERGE_FS_TO_TO_DSK_REQ = 2.5
+PICARD_FS_TO_TO_DSK_REQ = 2.5
+GATK_FS_TO_TO_DSK_REQ = 2.5
+CRAM_FS_TO_TO_DSK_REQ = 2.5
 REFERENCE_SIZE = 8 * 1024 * 1024 * 1024 #8G
 MAX_MEMORY = 32 * 1024 * 1024 * 1024 #32GB
 
@@ -169,8 +170,6 @@ def prepare_input(job, sample, config):
     work_dir = job.fileStore.getLocalTempDir()
 
     # global resource estimation
-    if config.input_file_size is None:
-        raise UserError("For now, configuration parameter input-file-size is required")
     config.cores = min(config.maxCores, multiprocessing.cpu_count())
     config.base_sample_size = config.input_file_size * len(urls)
     #todo remove this, should be specified
@@ -182,11 +181,11 @@ def prepare_input(job, sample, config):
     temporary_file_ids = [] #this is to track jobstore files which can be removed
     for url in urls:
         # alignment resource estimation
-        aln_disk = config.input_file_size * ALIGN_FS_TO_DSK_REQ #+ REFERENCE_SIZE
         aln_mem = str(config.alignment_memory if config.alignment_memory is not None else config.memory)
         aln_cpu = config.alignment_cores if config.alignment_cores is not None else config.cores
 
         if file_type == 'bam':
+            aln_disk = config.input_file_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE
             job.fileStore.logToMaster("Spawning job to handle {}".format(url))
             child_job = job.addChildJobFn(perform_alignment, config, "bam", sample_url=url, memory=aln_mem, cores=aln_cpu, disk=aln_disk)
             bam_ids.append(child_job.rv(0))
@@ -216,6 +215,7 @@ def prepare_input(job, sample, config):
             for bam_file in glob.glob(os.path.join(tar_work_dir, "*.bam")):
                 bam_file_id = job.fileStore.writeGlobalFile(bam_file)
                 job.fileStore.logToMaster("Spawning job to handle bam '{}' in '{}'".format(os.path.basename(bam_file), url))
+                aln_disk = os.stat(bam_file).st_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE
                 child_job = job.addChildJobFn(perform_alignment, config, "bam", sample_id=bam_file_id, memory=aln_mem,
                                               cores=aln_cpu, disk=aln_disk)
                 bam_ids.append(child_job.rv(0))
@@ -976,6 +976,7 @@ def main():
             mkdir_p(config.output_dir)
         require(config.reference, 'No reference tarball specified')
         require(config.variants, 'No variants tarball specified')
+        require(config.input_file_size, "For now, configuration parameter input-file-size is required")
         if config.save_intermediate_files is None or not isinstance(config.save_intermediate_files, bool):
             config.save_intermediate_files = False
         if not config.output_dir.endswith('/'):
@@ -989,7 +990,9 @@ def main():
             require(next(which(program), None), program + ' must be installed on every node.'.format(program))
 
         # Start the workflow
-        Job.Runner.startToil(Job.wrapJobFn(map_job, prepare_input, samples, config), args)
+        disk_req = config.input_file_size * PREPARE_FS_TO_TO_DSK_REQ
+        for sample in samples:
+            Job.Runner.startToil(Job.wrapJobFn(prepare_input, sample, config, disk=disk_req), args)
 
 
 if __name__ == '__main__':
