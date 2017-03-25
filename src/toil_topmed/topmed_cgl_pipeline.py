@@ -173,7 +173,7 @@ def prepare_input(job, sample, config):
     config.cores = min(config.maxCores, multiprocessing.cpu_count())
     config.base_sample_size = config.input_file_size * len(urls)
     #todo remove this, should be specified
-    config.disk = min(config.maxDisk, config.base_sample_size * ALIGN_FS_TO_DSK_REQ)
+    config.disk = int(min(config.maxDisk, config.base_sample_size * ALIGN_FS_TO_DSK_REQ))
 
 
     # need to hand each url off to appropriate processing
@@ -185,7 +185,7 @@ def prepare_input(job, sample, config):
         aln_cpu = config.alignment_cores if config.alignment_cores is not None else config.cores
 
         if file_type == 'bam':
-            aln_disk = config.input_file_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE
+            aln_disk = int(config.input_file_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE)
             job.fileStore.logToMaster("Spawning job to handle {}".format(url))
             child_job = job.addChildJobFn(perform_alignment, config, "bam", sample_url=url, memory=aln_mem, cores=aln_cpu, disk=aln_disk)
             bam_ids.append(child_job.rv(0))
@@ -215,7 +215,7 @@ def prepare_input(job, sample, config):
             for bam_file in glob.glob(os.path.join(tar_work_dir, "*.bam")):
                 bam_file_id = job.fileStore.writeGlobalFile(bam_file)
                 job.fileStore.logToMaster("Spawning job to handle bam '{}' in '{}'".format(os.path.basename(bam_file), url))
-                aln_disk = os.stat(bam_file).st_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE
+                aln_disk = int(os.stat(bam_file).st_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE)
                 child_job = job.addChildJobFn(perform_alignment, config, "bam", sample_id=bam_file_id, memory=aln_mem,
                                               cores=aln_cpu, disk=aln_disk)
                 bam_ids.append(child_job.rv(0))
@@ -247,7 +247,7 @@ def prepare_input(job, sample, config):
                             .format(url, file_type))
 
     job.addFollowOnJobFn(merge_sam_files, config, bam_ids, temporary_file_ids,
-                         memory=config.memory, cores=config.cores, disk=(config.base_sample_size * MERGE_FS_TO_TO_DSK_REQ))
+                         memory=config.memory, cores=config.cores, disk=int(config.base_sample_size * MERGE_FS_TO_TO_DSK_REQ))
 
 
 def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
@@ -446,7 +446,8 @@ def merge_sam_files(job, config, aligned_bam_ids, removable_file_ids=None):
 
     # add next job
     job.addFollowOnJobFn(mark_duplicates, config, output_id, aligned_bam_ids,
-                         memory=config.memory, cores=config.cores, disk=config.base_sample_size * PICARD_FS_TO_TO_DSK_REQ)
+                         memory=config.memory, cores=config.cores,
+                         disk=int(config.base_sample_size * PICARD_FS_TO_TO_DSK_REQ))
     job.fileStore.logToMaster("TIME:{}:merge_sam_files:{}".format(config.uuid, time.time() - start))
 
 
@@ -510,7 +511,8 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
 
     # add next job
     job.addFollowOnJobFn(recalibrate_quality_scores, config, deduped_bam_id, [aligned_bam_id],
-                         memory=config.memory, cores=config.cores, disk=config.base_sample_size * GATK_FS_TO_TO_DSK_REQ)
+                         memory=config.memory, cores=config.cores,
+                         disk=int(config.base_sample_size * GATK_FS_TO_TO_DSK_REQ))
     job.fileStore.logToMaster("TIME:{}:mark_duplicates:{}".format(config.uuid, time.time() - start))
 
 
@@ -584,7 +586,8 @@ def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=Non
 
     # add next job
     job.addFollowOnJobFn(bin_quality_scores, config, input_bam_id, bam_index_id, recalibration_report_id,
-                         memory=config.memory, cores=config.cores, disk=config.base_sample_size * GATK_FS_TO_TO_DSK_REQ)
+                         memory=config.memory, cores=config.cores,
+                         disk=int(config.base_sample_size * GATK_FS_TO_TO_DSK_REQ))
     job.fileStore.logToMaster("TIME:{}:recalibrate_quality_scores:{}".format(config.uuid, time.time() - start))
 
 #todo: merge these
@@ -651,7 +654,8 @@ def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, 
 
     # add next job
     job.addFollowOnJobFn(convert_to_cram_and_validate, config, output_bam_id, [input_bam_id, bam_index_id, bsqr_report_id],
-                         memory=config.memory, cores=config.cores, disk=config.base_sample_size * CRAM_FS_TO_TO_DSK_REQ)
+                         memory=config.memory, cores=config.cores,
+                         disk=int(config.base_sample_size * CRAM_FS_TO_TO_DSK_REQ))
     job.fileStore.logToMaster("TIME:{}:bin_quality_scores:{}".format(config.uuid, time.time() - start))
 
 
@@ -976,23 +980,18 @@ def main():
             mkdir_p(config.output_dir)
         require(config.reference, 'No reference tarball specified')
         require(config.variants, 'No variants tarball specified')
-        require(config.input_file_size, "For now, configuration parameter input-file-size is required")
+        require(config.input_file_size, "Configuration parameter input-file-size is required")
         if config.save_intermediate_files is None or not isinstance(config.save_intermediate_files, bool):
             config.save_intermediate_files = False
         if not config.output_dir.endswith('/'):
             config.output_dir += '/'
-        #missing alignment_cores indicates no special alignment configuration
-        # if config.alignment_cores is None:
-        #     config.alignment_cores = ALIGNMENT_CORES_DEFAULT
 
         # Program checks
         for program in ['curl', 'docker']:
             require(next(which(program), None), program + ' must be installed on every node.'.format(program))
 
         # Start the workflow
-        disk_req = config.input_file_size * PREPARE_FS_TO_TO_DSK_REQ
-        for sample in samples:
-            Job.Runner.startToil(Job.wrapJobFn(prepare_input, sample, config, disk=disk_req), args)
+        Job.Runner.startToil(Job.wrapJobFn(map_job, prepare_input, samples, config), args)
 
 
 if __name__ == '__main__':
