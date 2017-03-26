@@ -696,11 +696,17 @@ def convert_to_cram_and_validate(job, config, input_bam_id, removable_file_ids=N
 
     #todo validate
 
-    # save to output directory
+    # save to output
     output_bam_location = os.path.join(work_dir, input_bam_name)
     output_files = [output_cram_location, output_bam_location]
-    job.fileStore.logToMaster('Moving {} to output dir: {}'.format(output_bam_location, config.output_dir))
-    copy_files(file_paths=output_files, output_dir=config.output_dir)
+    if urlparse(config.output_dir).scheme == 's3':
+        for output_file in output_files:
+            job.fileStore.logToMaster('Uploading {} to S3: {}'.format(config.uuid, config.output_dir))
+            s3am_upload(fpath=output_file, s3_dir=config.output_dir, num_cores=config.cores)
+    else:
+        job.fileStore.logToMaster('Moving {} to output dir: {}'.format(config.uuid, config.output_dir))
+        mkdir_p(config.output_dir)
+        copy_files(file_paths=[os.path.join(work_dir, config.uuid + '.tar.gz')], output_dir=config.output_dir)
     job.fileStore.logToMaster("TIME:{}:validate_output:{}".format(config.uuid, time.time() - start))
     job.fileStore.logToMaster("END_TIME:{}:{}".format(config.uuid, datetime.datetime.now()))
 
