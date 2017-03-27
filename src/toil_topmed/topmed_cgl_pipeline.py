@@ -702,7 +702,7 @@ def convert_to_cram_and_validate(job, config, input_bam_id, removable_file_ids=N
     if urlparse(config.output_dir).scheme == 's3':
         for output_file in output_files:
             job.fileStore.logToMaster('Uploading {} to S3: {}'.format(config.uuid, config.output_dir))
-            s3am_upload(fpath=output_file, s3_dir=config.output_dir, num_cores=config.cores)
+            s3am_upload(job=job, fpath=output_file, s3_dir=config.output_dir, num_cores=config.cores)
     else:
         job.fileStore.logToMaster('Moving {} to output dir: {}'.format(config.uuid, config.output_dir))
         mkdir_p(config.output_dir)
