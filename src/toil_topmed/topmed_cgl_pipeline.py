@@ -149,19 +149,11 @@ def parse_samples(path_to_manifest):
     return samples
 
 
-def _files_with_suffix(urls, suffix):
-    """
-    Returns filtered list of files in 'urls' which end with the suffix (disregarding file type)
-    :param urls: list of fully-qualified file names (with or without scheme)
-    :param suffix: string (or string tuple) to filter files on
-    :return: list of strings
-    """
-    return filter(lambda u: os.path.splitext(os.path.basename(urlparse(u).path))[0].endswith(suffix), urls)
-
 
 def prepare_input(job, sample, config):
 
     # job prep
+    start = time.time()
     config = argparse.Namespace(**vars(config))
     uuid, file_type, paired, urls = sample
     config.uuid = uuid
@@ -248,6 +240,7 @@ def prepare_input(job, sample, config):
 
     job.addFollowOnJobFn(merge_sam_files, config, bam_ids, temporary_file_ids,
                          memory=config.memory, cores=config.cores, disk=int(config.base_sample_size * MERGE_FS_TO_TO_DSK_REQ))
+    _log_time(job, "prepare_input", start, config.uuid)
 
 
 def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
@@ -329,13 +322,14 @@ def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
 
     # it worked
     aligned_bam_id = job.fileStore.writeGlobalFile(output_bam_location)
-    job.fileStore.logToMaster("TIME:{}:perform_alignment:{}".format(config.uuid, time.time() - start))
+    _log_time(job, "perform_alignment", start, config.uuid)
 
     # return for next job (return sample id even if null)
     return aligned_bam_id, sample_id
 
 
 def extract_fastq_files_from_bam(job, work_dir, bam_name, is_paired, get_readgroup_header=True):
+    start = time.time()
 
     # get readgroup header
     readgroup_header = None
@@ -396,6 +390,7 @@ def extract_fastq_files_from_bam(job, work_dir, bam_name, is_paired, get_readgro
                                       .format(unpaired_size, bam_name))
 
     # return fastqs
+    _log_time(job, "extract_fastq_files_from_bam", start, bam_base)
     return fastq_files, readgroup_header
 
 
@@ -448,11 +443,13 @@ def merge_sam_files(job, config, aligned_bam_ids, removable_file_ids=None):
     job.addFollowOnJobFn(mark_duplicates, config, output_id, aligned_bam_ids,
                          memory=config.memory, cores=config.cores,
                          disk=int(config.base_sample_size * PICARD_FS_TO_TO_DSK_REQ))
-    job.fileStore.logToMaster("TIME:{}:merge_sam_files:{}".format(config.uuid, time.time() - start))
+    _log_time(job, "merge_bam_files", start, config.uuid)
 
 
-def _get_default_docker_params(work_dir):
-    return ['--rm','--log-driver','none', '-v', '{}:/data'.format(work_dir)]
+def sort_bam_file(job, config, sort_order, input_bam_id, removable_file_ids=None):
+    start = time.time()
+
+    _log_time(job, "sort_bam_file", start, config.uuid + ":" + sort_order)
 
 def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
     start = time.time()
@@ -471,8 +468,6 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
     job.fileStore.readGlobalFile(aligned_bam_id, os.path.join(work_dir, duped_bam_name))
 
     # Call docker image
-    #todo -Djava.io.tmpdir=/tmp
-    # picard MarkDuplicates I={} O={} M={} ASSUME_SORT_ORDER=coordinate
     metrics_filename = config.uuid + ".deduplication_metrics.txt"
     params = ["MarkDuplicates",
               "I={}".format(os.path.join("/data", duped_bam_name)),
@@ -513,7 +508,7 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
     job.addFollowOnJobFn(recalibrate_quality_scores, config, deduped_bam_id, [aligned_bam_id],
                          memory=config.memory, cores=config.cores,
                          disk=int(config.base_sample_size * GATK_FS_TO_TO_DSK_REQ))
-    job.fileStore.logToMaster("TIME:{}:mark_duplicates:{}".format(config.uuid, time.time() - start))
+    _log_time(job, "mark_duplicates", start, config.uuid)
 
 
 def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=None):
@@ -588,9 +583,8 @@ def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=Non
     job.addFollowOnJobFn(bin_quality_scores, config, input_bam_id, bam_index_id, recalibration_report_id,
                          memory=config.memory, cores=config.cores,
                          disk=int(config.base_sample_size * GATK_FS_TO_TO_DSK_REQ))
-    job.fileStore.logToMaster("TIME:{}:recalibrate_quality_scores:{}".format(config.uuid, time.time() - start))
+    _log_time(job, "recalibrate_quality_scores", start, config.uuid)
 
-#todo: merge these
 
 def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, removable_file_ids=None):
     start = time.time()
@@ -656,7 +650,7 @@ def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, 
     job.addFollowOnJobFn(convert_to_cram_and_validate, config, output_bam_id, [input_bam_id, bam_index_id, bsqr_report_id],
                          memory=config.memory, cores=config.cores,
                          disk=int(config.base_sample_size * CRAM_FS_TO_TO_DSK_REQ))
-    job.fileStore.logToMaster("TIME:{}:bin_quality_scores:{}".format(config.uuid, time.time() - start))
+    _log_time(job, "bin_quality_scores", start, config.uuid)
 
 
 def convert_to_cram_and_validate(job, config, input_bam_id, removable_file_ids=None):
@@ -707,13 +701,15 @@ def convert_to_cram_and_validate(job, config, input_bam_id, removable_file_ids=N
         job.fileStore.logToMaster('Moving {} to output dir: {}'.format(config.uuid, config.output_dir))
         mkdir_p(config.output_dir)
         copy_files(file_paths=[os.path.join(work_dir, config.uuid + '.tar.gz')], output_dir=config.output_dir)
-    job.fileStore.logToMaster("TIME:{}:validate_output:{}".format(config.uuid, time.time() - start))
-    job.fileStore.logToMaster("END_TIME:{}:{}".format(config.uuid, datetime.datetime.now()))
+
+    _log_time(job, "convert_to_cram_and_validate", start, config.uuid)
+    job.fileStore.logToMaster("END:{}:{}".format(config.uuid, datetime.datetime.now()))
 
 
 def remove_intermediate_jobstore_files(job, file_id_list):
     # for cases where there is nothing to remove: let this function handle it
     if file_id_list is None or len(file_id_list) == 0: return
+    start = time.time()
     # one case has file_id_list as list of list of files
     removed_files_count = 0
     for file_id in file_id_list:
@@ -728,6 +724,7 @@ def remove_intermediate_jobstore_files(job, file_id_list):
             removed_files_count += 1
     # log it
     job.fileStore.logToMaster("Removed {} intermediate files".format(len(file_id_list)))
+    _log_time(job, "remove_intermediate_jobstore_files", start)
 
 
 def index_bam(job, work_dir, bam_name):
@@ -741,7 +738,7 @@ def index_bam(job, work_dir, bam_name):
         raise UserError("File not found after indexing BAM: {}".format(bai_location))
     else:
         job.fileStore.logToMaster("Index created: {}".format(bai_location))
-    job.fileStore.logToMaster("TIME::index_bam:{}".format(time.time() - start))
+    _log_time(job, "index_bam", start)
     return bai_location
 
 
@@ -772,7 +769,7 @@ def download_reference(job, work_dir, reference_location):
         raise UserError("Reference tar '{}' not in expected format: {} => [{}/]{}"
                         .format(reference_location, reference_tar_name, reference_base_name, reference_fa_name))
 
-    job.fileStore.logToMaster("TIME::download_reference:{}".format(time.time() - start))
+    _log_time(job, "download_reference", start)
     return reference_fa_name
 
 
@@ -811,8 +808,26 @@ def download_variant(job, work_dir, variant_location):
         raise UserError("Variant tar '{}' not in expected format: {} => [{}/](example.vcf[.gz], example.vcf[.gz].[tbi|idx])+"
                         .format(variant_location, variant_base_name))
 
-    job.fileStore.logToMaster("TIME::download_variant:{}".format(time.time() - start))
+    _log_time(job, "download_variant", start)
     return variant_bases
+
+
+def _log_time(job, function_name, start_time, sample_identifier=''):
+    job.fileStore.logToMaster("TIME:{}:{}:{}".format(function_name, int(time.time() - start_time), sample_identifier))
+
+
+def _get_default_docker_params(work_dir):
+    return ['--rm','--log-driver','none', '-v', '{}:/data'.format(work_dir)]
+
+
+def _files_with_suffix(urls, suffix):
+    """
+    Returns filtered list of files in 'urls' which end with the suffix (disregarding file type)
+    :param urls: list of fully-qualified file names (with or without scheme)
+    :param suffix: string (or string tuple) to filter files on
+    :return: list of strings
+    """
+    return filter(lambda u: os.path.splitext(os.path.basename(urlparse(u).path))[0].endswith(suffix), urls)
 
 
 def generate_config():
