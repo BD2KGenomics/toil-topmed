@@ -40,9 +40,10 @@ PAIRED_BACK_SUFFIXES = ("_2", "R2")
 # resource estimatin
 PREPARE_FS_TO_TO_DSK_REQ = 2.5
 ALIGN_FS_TO_DSK_REQ = 6
+SORT_FS_TO_DSK_REQ = 2.5
 MERGE_FS_TO_TO_DSK_REQ = 2.5
 PICARD_FS_TO_TO_DSK_REQ = 2.5
-GATK_FS_TO_TO_DSK_REQ = 2.5
+GATK_FS_TO_DSK_REQ = 2.5
 CRAM_FS_TO_TO_DSK_REQ = 2.5
 REFERENCE_SIZE = 8 * 1024 * 1024 * 1024 #8G
 MAX_MEMORY = 32 * 1024 * 1024 * 1024 #32GB
@@ -153,20 +154,20 @@ def parse_samples(path_to_manifest):
 def prepare_input(job, sample, config):
 
     # job prep
-    start = time.time()
     config = argparse.Namespace(**vars(config))
     uuid, file_type, paired, urls = sample
     config.uuid = uuid
     config.file_type = file_type
     config.is_paired = paired
     work_dir = job.fileStore.getLocalTempDir()
+    start = time.time()
+    job.fileStore.logToMaster("START:{}:{}".format(config.uuid, datetime.datetime.now()))
 
     # global resource estimation
     config.cores = min(config.maxCores, multiprocessing.cpu_count())
     config.base_sample_size = config.input_file_size * len(urls)
     #todo remove this, should be specified
     config.disk = int(min(config.maxDisk, config.base_sample_size * ALIGN_FS_TO_DSK_REQ))
-
 
     # need to hand each url off to appropriate processing
     bam_ids = []
@@ -177,11 +178,18 @@ def prepare_input(job, sample, config):
         aln_cpu = config.alignment_cores if config.alignment_cores is not None else config.cores
 
         if file_type == 'bam':
+            srt_disk = int(config.input_file_size * SORT_FS_TO_DSK_REQ)
             aln_disk = int(config.input_file_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE)
             job.fileStore.logToMaster("Spawning job to handle {}".format(url))
-            child_job = job.addChildJobFn(perform_alignment, config, "bam", sample_url=url, memory=aln_mem, cores=aln_cpu, disk=aln_disk)
-            bam_ids.append(child_job.rv(0))
-            temporary_file_ids.append(child_job.rv(1))
+            # create jobs
+            sort_job = job.addChildJobFn(sort_bam_file, config, sample_url=url, sort_by_read_name=True,
+                                          memory=aln_mem, cores=aln_cpu, disk=srt_disk)
+            alignment_job = sort_job.addChildJobFn(perform_alignment, config, "bam", sample_id=sort_job.rv(),
+                                          memory=aln_mem, cores=aln_cpu, disk=aln_disk)
+            # save return values for follow on
+            bam_ids.append(alignment_job.rv(0))
+            temporary_file_ids.append(alignment_job.rv(1))
+
         elif file_type == 'tar':
             # name prep
             tar_name =  os.path.basename(url)
@@ -202,17 +210,30 @@ def prepare_input(job, sample, config):
                     shutil.move(file, dest)
                 os.rmdir(os.path.join(tar_work_dir, tar_base))
 
-            # handle file by type
+            # count child jobs
             file_count = 0
+            total_file_size = 0
+
+            # bam file type
             for bam_file in glob.glob(os.path.join(tar_work_dir, "*.bam")):
+                file_size = os.stat(bam_file).st_size
+                total_file_size += file_size
                 bam_file_id = job.fileStore.writeGlobalFile(bam_file)
                 job.fileStore.logToMaster("Spawning job to handle bam '{}' in '{}'".format(os.path.basename(bam_file), url))
-                aln_disk = int(os.stat(bam_file).st_size * ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE)
-                child_job = job.addChildJobFn(perform_alignment, config, "bam", sample_id=bam_file_id, memory=aln_mem,
-                                              cores=aln_cpu, disk=aln_disk)
-                bam_ids.append(child_job.rv(0))
-                temporary_file_ids.append(child_job.rv(1))
+                srt_disk = int(file_size * SORT_FS_TO_DSK_REQ)
+                aln_disk = int(file_size* ALIGN_FS_TO_DSK_REQ + REFERENCE_SIZE)
+                # create jobs, save RVs
+                sort_job = job.addChildJobFn(sort_bam_file, config, sample_id=bam_file_id, sort_by_read_name=True,
+                                             memory=aln_mem, cores=aln_cpu, disk=srt_disk)
+                alignment_job = sort_job.addChildJobFn(perform_alignment, config, "bam", sample_id=sort_job.rv(),
+                                                  memory=aln_mem, cores=aln_cpu, disk=aln_disk)
+                # save return values for follow on
+                bam_ids.append(alignment_job.rv(0))
+                temporary_file_ids.append(alignment_job.rv(1))
+                temporary_file_ids.append(bam_file_id)
                 file_count += 1
+
+            # fq files
             for fq_glob in [os.path.join(tar_work_dir, ("*" + fq)) for fq in FQ_FORMATS]:
                 for fq in glob.glob(fq_glob):
                     raise UserError("FASTQ files in 'tar' not supported: {}".format(fq))
@@ -226,6 +247,7 @@ def prepare_input(job, sample, config):
             job.fileStore.logToMaster("Spawned {} jobs to handle {}".format(file_count, url))
             if file_count == 0:
                 raise UserError("Got no files in tar: '{}'".format(url))
+            config.base_sample_size = total_file_size
 
 
         # just need to download
@@ -233,6 +255,7 @@ def prepare_input(job, sample, config):
             # download_url(job, url=url, work_dir=fastq_location)
             #todo: how to specify read group?
             raise UserError("FQ not implemented")
+
         # should never happen
         else:
             raise UserError('PROGRAMMER ERROR: URL "{}" with type "{}" did not match expected cases for preprocessing'
@@ -246,37 +269,21 @@ def prepare_input(job, sample, config):
 def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
 
     # validate input
-    if sample_url is None and sample_id is None:
-        raise UserError("perform_alignment invoked with neither sample_url nor sample_id")
-    if sample_url is not None and sample_id is not None:
-        raise UserError("perform_alignment invoked with both sample_url and sample_id")
     if input_type != "bam":
         raise UserError("input format '{}' not supported for perform_alignment".format(input_type))
 
-    # prep
-    job.fileStore.logToMaster("START_TIME:{}:{}".format(config.uuid, datetime.datetime.now()))
     start = time.time()
     work_dir = job.fileStore.getLocalTempDir()
     is_paired = config.is_paired
-    is_global_file = sample_id is not None
+    output_filename="{}.out.bam".format(config.uuid)
 
     # download bam
-    filename = "{}.in.bam".format(config.uuid)
-    output_filename="{}.out.bam".format(config.uuid)
-    if is_global_file:
-        job.fileStore.readGlobalFile(sample_id, os.path.join(work_dir, filename))
-    else:
-        download_url(job, url=sample_url, work_dir=work_dir)
-        filename = os.path.basename(sample_url)
-        output_filename=config.uuid+"."+filename
-    if not os.path.isfile(os.path.join(work_dir, filename)):
-        raise UserError("Failed to download {}".format(sample_url))
-
+    filename = _download_url_or_file_id(job, config, work_dir, sample_url=sample_url, sample_id=sample_id)
     job.fileStore.logToMaster("Performing alignment on {} with {} input"
                               .format(filename, "single" if not is_paired else "paired"))
 
     # get fq files from bam
-    fq_files, read_group_header = extract_fastq_files_from_bam(job, work_dir, filename, is_paired)
+    fq_files, read_group_header = _extract_fastq_files_from_bam(job, work_dir, filename, is_paired)
 
     # get reference files
     reference_location = os.path.join(work_dir, "reference")
@@ -292,19 +299,15 @@ def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
         bwa_cmd += os.path.join("/data", os.path.basename(fq_files[1]))
     # other commands
     samblaster_cmd = "samblaster --addMateTags"
-    samtools_sam2bam_cmd = "samtools view -Sb -"
-    #todo set cores on sort cmd.  split cores?
-    samtools_sort_cmd = "samtools sort -@ {} -T {} -o {}".format(cores, config.uuid + ".sorting",
-                                                                 os.path.join("/data", output_filename))
+    samtools_sam2bam_cmd = "samtools view -Sb -o {}".format(os.path.join("/data", output_filename))
 
     # modification for the docker file I use
     bwa_cmd = "/opt/bwa.kit/"+bwa_cmd
     samblaster_cmd = "/opt/samblaster-v.0.1.24/"+samblaster_cmd
     samtools_sam2bam_cmd = "/opt/bwa.kit/"+samtools_sam2bam_cmd
-    samtools_sort_cmd = "/opt/bwa.kit/"+samtools_sort_cmd
 
     # run the command
-    params = [bwa_cmd.split(" "), samblaster_cmd.split(), samtools_sam2bam_cmd.split(), samtools_sort_cmd.split()]
+    params = [bwa_cmd.split(" "), samblaster_cmd.split(), samtools_sam2bam_cmd.split()]
     job.fileStore.logToMaster("Running {} with parameters: {}".format(DOCKER_BWAKIT, params))
     dockerCall(job, tool=DOCKER_BWAKIT, workDir=work_dir, parameters=params)
 
@@ -328,7 +331,39 @@ def perform_alignment(job, config, input_type, sample_url=None, sample_id=None):
     return aligned_bam_id, sample_id
 
 
-def extract_fastq_files_from_bam(job, work_dir, bam_name, is_paired, get_readgroup_header=True):
+def _download_url_or_file_id(job, config, work_dir, sample_url=None, sample_id=None, filename=None):    # validate input
+    # validate input
+    if sample_url is None and sample_id is None:
+        raise UserError("download_url_or_file_id invoked with neither sample_url nor sample_id")
+    if sample_url is not None and sample_id is not None:
+        raise UserError("download_url_or_file_id invoked with both sample_url and sample_id")
+
+    # prep
+    start = time.time()
+    is_in_filestore = sample_id is not None
+    if filename is None:
+        if is_in_filestore:
+            filename = config.uuid + ".in.bam"
+        else:
+            filename = os.path.basename(sample_url)
+    output_location = os.path.join(work_dir, filename)
+
+    # read file
+    if is_in_filestore:
+        job.fileStore.readGlobalFile(sample_id, output_location)
+    else:
+        download_url(job, url=sample_url, work_dir=work_dir)
+
+    # sanity check
+    if not os.path.isfile(output_location):
+        raise UserError("Failed to download {} from {}".format(filename, "filestore" if is_in_filestore else sample_url))
+
+    # return filename (location is assumed to be in the work_dir)
+    _log_time(job, "download_url_or_file_id", start, config.uuid + "." + ("filestore" if is_in_filestore else "url"))
+    return filename
+
+
+def _extract_fastq_files_from_bam(job, work_dir, bam_name, is_paired, get_readgroup_header=True):
     start = time.time()
 
     # get readgroup header
@@ -446,12 +481,47 @@ def merge_sam_files(job, config, aligned_bam_ids, removable_file_ids=None):
     _log_time(job, "merge_bam_files", start, config.uuid)
 
 
-def sort_bam_file(job, config, sort_order, input_bam_id, removable_file_ids=None):
+def sort_bam_file(job, config, sample_url = None, sample_id = None, sort_by_read_name=False, removable_file_ids=None):
     start = time.time()
 
-    _log_time(job, "sort_bam_file", start, config.uuid + ":" + sort_order)
+    # cleanup of unnecessary files from previous steps
+    remove_intermediate_jobstore_files(job, removable_file_ids)
 
-def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
+    #prep
+    work_dir = job.fileStore.getLocalTempDir()
+    input_bam_name = _download_url_or_file_id(job, config, work_dir, sample_url, sample_id)
+    output_bam_name = config.uuid + ".sorted.bam"
+    cores = config.alignment_cores if config.alignment_cores is not None else config.cores
+    job.fileStore.logToMaster('Sorting {} with {} cores'.format(input_bam_name, cores))
+
+    # Call out to docker
+    params = ["sort", '-@', str(cores),  '-T', str(config.uuid + ".srt"), '-o', os.path.join("/data", output_bam_name)]
+    if sort_by_read_name:
+        params.append("-n")
+    params.append(os.path.join("/data", input_bam_name))
+    job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_SAMTOOLS, params))
+    dockerCall(job, tool=DOCKER_SAMTOOLS, workDir=work_dir, parameters=params)
+
+    # sanity check
+    output_bam_location = os.path.join(work_dir, output_bam_name)
+    if not os.path.isfile(output_bam_location):
+        raise UserError('Sorted BAM file "{}" does not exist'.format(output_bam_location))
+
+    # save to output directory (for development)
+    if config.save_intermediate_files:
+        job.fileStore.logToMaster('Moving {} to output dir: {}'.format(output_bam_location, config.output_dir))
+        copy_files(file_paths=[output_bam_location], output_dir=config.output_dir)
+
+    # save the file
+    output_bam_id = job.fileStore.writeGlobalFile(output_bam_location)
+    _log_time(job, "sort_bam_file", start, config.uuid + "." + ("read_name" if sort_by_read_name else "coordinate"))
+
+    return output_bam_id
+
+
+def mark_duplicates(job, config, input_bam_id, removable_file_ids=None):
+    #note: this function depends on having reads sorted by read name
+
     start = time.time()
 
     # cleanup of unnecessary files from previous steps
@@ -465,7 +535,7 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
     mkdir_p(os.path.join(work_dir, ".java_tmp"))
 
     # read file
-    job.fileStore.readGlobalFile(aligned_bam_id, os.path.join(work_dir, duped_bam_name))
+    job.fileStore.readGlobalFile(input_bam_id, os.path.join(work_dir, duped_bam_name))
 
     # Call docker image
     metrics_filename = config.uuid + ".deduplication_metrics.txt"
@@ -473,7 +543,7 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
               "I={}".format(os.path.join("/data", duped_bam_name)),
               "O={}".format(os.path.join("/data", deduped_bam_name)),
               "M={}".format(os.path.join("/data", metrics_filename)),
-              "ASSUME_SORT_ORDER=coordinate"]
+              "ASSUME_SORT_ORDER=queryname"] #not 'coordinate'
     job.fileStore.logToMaster("Calling {} with params: {}".format(DOCKER_PICARD, params))
 
     docker_params = _get_default_docker_params(work_dir)
@@ -505,9 +575,12 @@ def mark_duplicates(job, config, aligned_bam_id, removable_file_ids=None):
         copy_files(file_paths=outfiles, output_dir=config.output_dir)
 
     # add next job
-    job.addFollowOnJobFn(recalibrate_quality_scores, config, deduped_bam_id, [aligned_bam_id],
-                         memory=config.memory, cores=config.cores,
-                         disk=int(config.base_sample_size * GATK_FS_TO_TO_DSK_REQ))
+    sort_job = job.addChildJobFn(sort_bam_file, config, sample_id = deduped_bam_id, removable_file_ids=[input_bam_id],
+                                 memory=config.memory, cores=config.cores,
+                                 disk=int(config.base_sample_size * SORT_FS_TO_DSK_REQ) )
+    recal_job = sort_job.addChildJobFn(recalibrate_quality_scores, config, sort_job.rv(), [deduped_bam_id],
+                                       memory=config.memory, cores=config.cores,
+                                       disk=int(config.base_sample_size * GATK_FS_TO_DSK_REQ))
     _log_time(job, "mark_duplicates", start, config.uuid)
 
 
@@ -580,9 +653,9 @@ def recalibrate_quality_scores(job, config, input_bam_id, removable_file_ids=Non
         copy_files(file_paths=[recalibration_report_location], output_dir=config.output_dir)
 
     # add next job
-    job.addFollowOnJobFn(bin_quality_scores, config, input_bam_id, bam_index_id, recalibration_report_id,
+    job.addChildJobFn(bin_quality_scores, config, input_bam_id, bam_index_id, recalibration_report_id,
                          memory=config.memory, cores=config.cores,
-                         disk=int(config.base_sample_size * GATK_FS_TO_TO_DSK_REQ))
+                         disk=int(config.base_sample_size * GATK_FS_TO_DSK_REQ))
     _log_time(job, "recalibrate_quality_scores", start, config.uuid)
 
 
@@ -647,7 +720,7 @@ def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, 
         copy_files(file_paths=[output_bam_location], output_dir=config.output_dir)
 
     # add next job
-    job.addFollowOnJobFn(convert_to_cram_and_validate, config, output_bam_id, [input_bam_id, bam_index_id, bsqr_report_id],
+    job.addChildJobFn(convert_to_cram_and_validate, config, output_bam_id, [input_bam_id, bam_index_id, bsqr_report_id],
                          memory=config.memory, cores=config.cores,
                          disk=int(config.base_sample_size * CRAM_FS_TO_TO_DSK_REQ))
     _log_time(job, "bin_quality_scores", start, config.uuid)
@@ -1004,11 +1077,13 @@ def main():
         require(config.input_file_size, "Configuration parameter input-file-size is required")
         if config.save_intermediate_files is None or not isinstance(config.save_intermediate_files, bool):
             config.save_intermediate_files = False
+        if config.save_intermediate_files and urlparse(config.output_dir).scheme == "s3":
+            raise UserError("Intermediate files may not be saved to S3")
         if not config.output_dir.endswith('/'):
             config.output_dir += '/'
 
         # Program checks
-        for program in ['curl', 'docker']:
+        for program in ['docker']:
             require(next(which(program), None), program + ' must be installed on every node.'.format(program))
 
         # Start the workflow
