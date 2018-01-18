@@ -698,8 +698,8 @@ def bin_quality_scores(job, config, input_bam_id, bam_index_id, bsqr_report_id, 
                        "--disable_indel_quals",
                        "--useOriginalQualities",
                        "-rf", "BadCigar",
-                       "-nct", str(config.cores),
-                       "--emit_original_quals"]
+                       "-nct", str(config.cores)]
+                       # "--emit_original_quals",
                        # "--createOutputBamMD5",
                        # "--addOutputSAMProgramRecord",
     params.extend(optional_params)
